@@ -76,3 +76,13 @@ A naive `run.text.replace()` approach would miss this entirely. This tool instea
 - **No regex** — Find text is matched literally (case-sensitive or case-insensitive)
 - **No undo** — Use the backup feature; there is no built-in undo
 - **Cross-run edge case** — If the find text is split across runs in an unusual way (e.g., a run boundary falls in the middle of a character in a multi-byte encoding), replacement may not work correctly. This is extremely rare in practice.
+
+## Copyright Notice
+
+**Copyright © 2025 Abraham Borg. All Rights Reserved.**
+
+This software and associated documentation files (the "Software") are the proprietary property of Abraham Borg. 
+
+**Unauthorized copying, modification, distribution, or use of this Software, via any medium, is strictly prohibited without express written permission from the copyright holder.**
+
+This Software is provided for review and reference purposes only. No license or right to use, copy, modify, or distribute this Software for any purpose, commercial or non-commercial, is granted.
