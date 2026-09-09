@@ -11,7 +11,7 @@ import sys
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from document_processor import scan_documents, apply_changes, FileResult, Match
+from document_processor import scan_documents_detailed, apply_changes, FileResult, Match
 from typing import List
 
 
@@ -79,7 +79,7 @@ class FindReplaceApp:
         options_frame.pack(fill=tk.X, pady=(6, 2))
 
         self.backup_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(options_frame, text="Create backups (.docx.bak)",
+        ttk.Checkbutton(options_frame, text="Create backups (timestamped .bak)",
                         variable=self.backup_var).pack(side=tk.LEFT)
 
         self.case_var = tk.BooleanVar(value=True)
@@ -185,8 +185,8 @@ class FindReplaceApp:
         case_sensitive = self.case_var.get()
 
         try:
-            results = scan_documents(folder, find_text, case_sensitive)
-            self.root.after(0, self._display_results, results)
+            results, summary = scan_documents_detailed(folder, find_text, case_sensitive)
+            self.root.after(0, self._display_results, results, summary)
         except Exception as e:
             self.root.after(0, self._preview_error, str(e))
 
@@ -197,7 +197,7 @@ class FindReplaceApp:
         self.progress_var.set("Error during scan")
         messagebox.showerror("Scan Error", f"An error occurred:\n{error_msg}")
 
-    def _display_results(self, results: List[FileResult]):
+    def _display_results(self, results: List[FileResult], summary: dict):
         """Populate the treeview with scan results (main thread)."""
         self.scan_results = results
         self.all_matches.clear()
@@ -244,10 +244,13 @@ class FindReplaceApp:
             self.apply_btn.configure(state=tk.NORMAL)
             self.progress_var.set(f"Found {total_matches} match{'es' if total_matches != 1 else ''} "
                                    f"in {total_files} file{'s' if total_files != 1 else ''}")
-        elif not results:
+        elif summary.get('files_scanned', 0) == 0:
             self.progress_var.set("No .docx files found in the selected folder")
         else:
-            self.progress_var.set("No matches found")
+            scanned = summary['files_scanned']
+            self.progress_var.set(
+                f"No matches found in {scanned} .docx file{'s' if scanned != 1 else ''}"
+            )
 
         self._update_match_count()
 
@@ -405,18 +408,33 @@ class FindReplaceApp:
         self.preview_btn.configure(state=tk.NORMAL)
         self.has_previewed = False
 
+        skipped = result.get('total_skipped', 0)
+
         msg = (f"Completed!\n\n"
                f"Replacements made: {result['total_replaced']}\n"
                f"Files modified: {result['files_modified']}")
+
+        if result.get('backups'):
+            msg += f"\nBackups created: {len(result['backups'])}"
+
+        if skipped:
+            # A selected match that could not be applied must never disappear
+            # quietly - the preview promised it would be changed.
+            msg += (f"\n\n\u26A0 {skipped} selected "
+                    f"{'change was' if skipped == 1 else 'changes were'} NOT applied.\n"
+                    f"The document may have been edited since the preview. "
+                    f"Re-run Preview Changes to see the current state.")
 
         if result['errors']:
             msg += f"\n\nErrors ({len(result['errors'])}):\n"
             for err in result['errors']:
                 msg += f"  - {err}\n"
 
-        self.progress_var.set(
-            f"Done: {result['total_replaced']} replacements in {result['files_modified']} files"
-        )
+        status = (f"Done: {result['total_replaced']} replacements "
+                  f"in {result['files_modified']} files")
+        if skipped:
+            status += f" ({skipped} skipped)"
+        self.progress_var.set(status)
 
         messagebox.showinfo("Changes Applied", msg)
 
