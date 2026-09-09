@@ -198,3 +198,80 @@ def test_progress_callback_is_invoked(repeated_doc):
                      progress_callback=lambda name, i, total: seen.append((name, i, total)))
     assert seen
     assert seen[-1][0] == "Done"
+
+
+# ----------------------------------------------------- failure-path accounting
+
+def test_backup_failure_is_counted_as_skipped(repeated_doc, monkeypatch):
+    """
+    A backup that cannot be written leaves the file unchanged, but those matches
+    must still reach total_skipped. Otherwise the GUI's skipped-change warning
+    never fires and the selected replacements vanish from the accounting - the
+    exact silent gap this module exists to prevent.
+    """
+    def boom(*args, **kwargs):
+        raise OSError("destination is not writable")
+    monkeypatch.setattr(dp.shutil, "copy2", boom)
+
+    matches = _scan(repeated_doc, "2022")
+    before = all_text(repeated_doc)
+
+    result = dp.apply_changes(matches, "2025", create_backups=True)
+
+    assert result['total_replaced'] == 0
+    assert result['total_skipped'] == len(matches)
+    assert result['errors']
+    assert all(m.applied is False for m in matches)
+    assert all_text(repeated_doc) == before
+
+
+def test_save_failure_is_counted_as_skipped(repeated_doc, monkeypatch):
+    def boom(doc, path):
+        raise PermissionError("file is open in another application")
+    monkeypatch.setattr(dp, "_save_atomically", boom)
+
+    matches = _scan(repeated_doc, "2022")
+    result = dp.apply_changes(matches, "2025", create_backups=False)
+
+    assert result['total_replaced'] == 0
+    assert result['total_skipped'] == len(matches)
+    assert result['errors']
+
+
+def test_selected_matches_are_never_double_counted(repeated_doc):
+    """replaced + skipped must equal the selection on the success path too."""
+    matches = _scan(repeated_doc, "2022")
+    result = dp.apply_changes(matches, "2025", create_backups=False)
+    assert result['total_replaced'] + result['total_skipped'] == len(matches)
+
+
+# ----------------------------------------------------- field results
+
+def test_complex_field_result_is_scanned_and_replaced(field_doc):
+    """
+    A complex field (TOC entry, cross-reference) stores its cached result in an
+    ordinary w:t, so it is scanned and replaced like any other text. Word may
+    regenerate it from the field code on update; README documents that.
+    """
+    matches = _scan(field_doc, "2022 CBC")
+    assert len(matches) == 1  # the complex field result; w:fldSimple is not scanned
+
+    result = dp.apply_changes(matches, "2025 CBC", create_backups=False)
+    assert result['total_replaced'] == 1
+    assert "Refer to 2025 CBC and " in all_text(field_doc)[0]
+
+
+def test_field_instruction_text_is_never_scanned(field_doc):
+    """w:instrText holds the field code, not visible text. Editing it breaks the field."""
+    matches = _scan(field_doc, "REF")
+    assert matches == []
+
+    doc = Document(field_doc)
+    p_el = dp._collect_paragraphs(doc)[0][0]
+    assert "REF" not in dp.paragraph_text(p_el)
+
+
+def test_simple_field_result_is_not_scanned(field_doc):
+    """w:fldSimple is not in the descend allowlist, so its result is left alone."""
+    matches = _scan(field_doc, "2022 CBC simple")
+    assert matches == []

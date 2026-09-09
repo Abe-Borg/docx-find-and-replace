@@ -82,8 +82,15 @@ skips `mc:Fallback` copies (Word writes each text box twice) and skips nested
 text boxes that the inner walk will reach on its own.
 
 `w:del` and `w:moveFrom` are excluded: that text is already marked deleted and
-must not be edited. `w:fldSimple` is excluded: it holds a cached field result
-Word regenerates.
+must not be edited. `w:fldSimple` is excluded, so its cached result is not
+scanned.
+
+Note the asymmetry: a **complex** field (`w:fldChar` begin / `w:instrText` /
+separate / result / end) keeps its cached result in ordinary `w:r`/`w:t` runs,
+so the walk does scan and replace it. Word regenerates that text on field
+update, which reverts the replacement — README documents this under "Field
+results can revert". Only `w:instrText` (the field code) is never read. If you
+change either behaviour, change the README bullet in the same commit.
 
 ## Testing
 

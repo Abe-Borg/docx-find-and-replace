@@ -636,82 +636,85 @@ def apply_changes(matches: List[Match], replace_text: str,
         if progress_callback:
             progress_callback(file_name, file_idx, total_files)
 
+        # Accounting runs in the `finally` below so that every early exit from
+        # this block - an unreadable file, a backup that cannot be written, a
+        # failed save - still reports its matches as skipped. A selected change
+        # must never disappear from the totals.
         try:
-            doc = Document(file_path)
-        except Exception as e:
-            errors.append(f"Could not open {file_name}: {e}")
-            for m in file_matches:
-                m.applied = False
-            total_skipped += len(file_matches)
-            continue
-
-        try:
-            all_paragraphs = _collect_paragraphs(doc)
-        except Exception as e:
-            errors.append(f"Could not read structure of {file_name}: {e}")
-            for m in file_matches:
-                m.applied = False
-            total_skipped += len(file_matches)
-            continue
-
-        para_lookup = {key: p_el for p_el, _t, _d, key in all_paragraphs}
-
-        # Group this file's matches by the paragraph they belong to.
-        by_paragraph: Dict[str, List[Match]] = {}
-        for match in file_matches:
-            by_paragraph.setdefault(match.paragraph_key, []).append(match)
-
-        file_replaced = 0
-
-        for para_key, para_matches in by_paragraph.items():
-            p_el = para_lookup.get(para_key)
-            if p_el is None:
-                # The document changed between scanning and applying.
-                for m in para_matches:
+            try:
+                doc = Document(file_path)
+            except Exception as e:
+                errors.append(f"Could not open {file_name}: {e}")
+                for m in file_matches:
                     m.applied = False
                 continue
 
-            find_text = para_matches[0].match_text
-            applied_offsets, _skipped = _replace_in_paragraph(
-                p_el, find_text, replace_text,
-                [m.char_offset for m in para_matches],
-                case_sensitive,
-            )
-            applied_set = set(applied_offsets)
-            for m in para_matches:
-                m.applied = m.char_offset in applied_set
-            file_replaced += len(applied_set)
+            try:
+                all_paragraphs = _collect_paragraphs(doc)
+            except Exception as e:
+                errors.append(f"Could not read structure of {file_name}: {e}")
+                for m in file_matches:
+                    m.applied = False
+                continue
 
-        if file_replaced > 0:
-            # Back up only once we know the file is genuinely about to change.
-            backup_path = None
-            if create_backups:
-                backup_path = _make_backup_path(file_path)
-                try:
-                    shutil.copy2(file_path, backup_path)
-                except Exception as e:
-                    errors.append(f"Could not create backup for {file_name}: {e} "
-                                  f"(file left unchanged)")
-                    for m in file_matches:
+            para_lookup = {key: p_el for p_el, _t, _d, key in all_paragraphs}
+
+            # Group this file's matches by the paragraph they belong to.
+            by_paragraph: Dict[str, List[Match]] = {}
+            for match in file_matches:
+                by_paragraph.setdefault(match.paragraph_key, []).append(match)
+
+            file_replaced = 0
+
+            for para_key, para_matches in by_paragraph.items():
+                p_el = para_lookup.get(para_key)
+                if p_el is None:
+                    # The document changed between scanning and applying.
+                    for m in para_matches:
                         m.applied = False
                     continue
 
-            try:
-                _save_atomically(doc, file_path)
-                files_modified += 1
-                total_replaced += file_replaced
-                if backup_path:
-                    backups.append(backup_path)
-            except PermissionError:
-                errors.append(f"Permission denied saving {file_name} (file may be open)")
-                for m in file_matches:
-                    m.applied = False
-            except Exception as e:
-                errors.append(f"Error saving {file_name}: {e}")
-                for m in file_matches:
-                    m.applied = False
+                find_text = para_matches[0].match_text
+                applied_offsets, _skipped = _replace_in_paragraph(
+                    p_el, find_text, replace_text,
+                    [m.char_offset for m in para_matches],
+                    case_sensitive,
+                )
+                applied_set = set(applied_offsets)
+                for m in para_matches:
+                    m.applied = m.char_offset in applied_set
+                file_replaced += len(applied_set)
 
-        total_skipped += sum(1 for m in file_matches if not m.applied)
+            if file_replaced > 0:
+                # Back up only once we know the file is genuinely about to change.
+                backup_path = None
+                if create_backups:
+                    backup_path = _make_backup_path(file_path)
+                    try:
+                        shutil.copy2(file_path, backup_path)
+                    except Exception as e:
+                        errors.append(f"Could not create backup for {file_name}: {e} "
+                                      f"(file left unchanged)")
+                        for m in file_matches:
+                            m.applied = False
+                        continue
+
+                try:
+                    _save_atomically(doc, file_path)
+                    files_modified += 1
+                    total_replaced += file_replaced
+                    if backup_path:
+                        backups.append(backup_path)
+                except PermissionError:
+                    errors.append(f"Permission denied saving {file_name} (file may be open)")
+                    for m in file_matches:
+                        m.applied = False
+                except Exception as e:
+                    errors.append(f"Error saving {file_name}: {e}")
+                    for m in file_matches:
+                        m.applied = False
+        finally:
+            total_skipped += sum(1 for m in file_matches if not m.applied)
 
     if progress_callback:
         progress_callback("Done", total_files - 1 if total_files else 0, total_files)

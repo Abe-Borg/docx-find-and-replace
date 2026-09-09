@@ -79,6 +79,36 @@ def add_deletion(paragraph, text, author="Reviewer"):
     paragraph._p.append(parse_xml(xml))
 
 
+def add_complex_field(paragraph, instruction, cached_result):
+    """
+    Append a complex field: fldChar begin / instrText / separate / cached
+    result / fldChar end.
+
+    This is how Word stores a TOC entry or a cross-reference. The cached result
+    lives in an ordinary <w:t>, which is why it is scanned like any other text.
+    """
+    parts = [
+        '<w:r><w:fldChar w:fldCharType="begin"/></w:r>',
+        '<w:r><w:instrText xml:space="preserve">%s</w:instrText></w:r>' % _escape(instruction),
+        '<w:r><w:fldChar w:fldCharType="separate"/></w:r>',
+        '<w:r><w:t xml:space="preserve">%s</w:t></w:r>' % _escape(cached_result),
+        '<w:r><w:fldChar w:fldCharType="end"/></w:r>',
+    ]
+    for part in parts:
+        xml = part.replace('<w:r>', '<w:r xmlns:w="%s">' % NS_W, 1)
+        paragraph._p.append(parse_xml(xml))
+
+
+def add_simple_field(paragraph, instruction, cached_result):
+    """Append a <w:fldSimple> whose cached result sits in a child run."""
+    xml = (
+        '<w:fldSimple xmlns:w="%s" w:instr="%s">'
+        '<w:r><w:t xml:space="preserve">%s</w:t></w:r></w:fldSimple>'
+        % (NS_W, _escape(instruction), _escape(cached_result))
+    )
+    paragraph._p.append(parse_xml(xml))
+
+
 def add_vml_textbox(paragraph, text):
     """Append a legacy VML text box containing a paragraph of `text`."""
     xml = (
@@ -229,6 +259,21 @@ def alt_content_doc(docdir):
     add_run(p, "Anchor.")
     add_alternate_content_textbox(p, "Choice 2022 CBC", "Choice 2022 CBC")
     path = docdir / "altcontent.docx"
+    doc.save(str(path))
+    return str(path)
+
+
+@pytest.fixture
+def field_doc(docdir):
+    """A complex field (cross-reference) and a w:fldSimple, both citing 2022 CBC."""
+    doc = Document()
+    p = doc.add_paragraph()
+    add_run(p, "Refer to ")
+    add_complex_field(p, r' REF _Ref1 \\h ', "2022 CBC")
+    add_run(p, " and ")
+    add_simple_field(p, r' REF _Ref2 \\h ', "2022 CBC simple")
+    add_run(p, " end.")
+    path = docdir / "fields.docx"
     doc.save(str(path))
     return str(path)
 
