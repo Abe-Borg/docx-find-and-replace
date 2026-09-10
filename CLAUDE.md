@@ -206,6 +206,13 @@ Other things worth not relearning:
 - Never change `AppId` in `installer.iss`. It is how Windows tells an upgrade
   from a second copy; changing it strands the installed version.
 - Bump the version in `version.py` only. Nothing else should hard-code it.
+- A release tag must match `version.py`. Everything that names or stamps a
+  binary reads `version.py`, but the release is created from the pushed tag,
+  and nothing else reconciles them — a `v1.1.0` tag pushed against a 1.0.0
+  `version.py` would publish a release labelled 1.1.0 containing binaries
+  stamped 1.0.0. `packaging/check_tag.py` fails the build before anything is
+  built; it is plain Python precisely so it can be tested here rather than
+  trusted because it reads well in YAML.
 
 ## Documentation
 
