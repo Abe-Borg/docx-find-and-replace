@@ -163,3 +163,24 @@ def test_files_scanned_counts_examined_files_not_the_listing(docdir):
     results, summary = dp.scan_documents_detailed(str(docdir), "2022", True)
     assert summary['files_scanned'] == 1
     assert results == []
+
+
+def test_note_parts_load_as_xml_on_every_supported_version():
+    """
+    Footnote, endnote and comment parts must arrive with an element tree to walk.
+
+    python-docx registers a class for comments only from 1.2.0 and never for
+    footnotes or endnotes, while requirements.txt supports 1.1.0 upward. Relying
+    on the library's own registration made comment coverage depend on which
+    version pip resolved - the same version-roulette failure this project
+    already pinned requirements.txt to avoid.
+    """
+    from docx.opc.constants import CONTENT_TYPE as CT
+    from docx.opc.part import PartFactory, XmlPart
+
+    for content_type in (CT.WML_FOOTNOTES, CT.WML_ENDNOTES, CT.WML_COMMENTS):
+        part_class = PartFactory.part_type_for.get(content_type)
+        assert part_class is not None, f"{content_type} is not registered"
+        assert issubclass(part_class, XmlPart), (
+            f"{content_type} loads as {part_class}, which has no element tree"
+        )

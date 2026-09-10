@@ -101,13 +101,20 @@ must not be edited. `w:fldSimple` is excluded, so its cached result is not
 scanned.
 
 Footnotes, endnotes and comments live in their own parts, reached by
-relationship from the document part (`_NOTE_PARTS`). python-docx registers a
-class for comments but not for footnotes or endnotes, so those would load as
-opaque blobs with nothing to walk or edit; the module registers them as
-`XmlPart` through `PartFactory.part_type_for` at import. That is the documented
-extension point — use `setdefault` so a future python-docx that ships its own
-class keeps precedence. Word's `separator` and `continuationSeparator` footnote
-entries are rule lines, not content, and are skipped.
+relationship from the document part (`_NOTE_PARTS`). Any part that is not
+registered as an XML part loads as an opaque blob with nothing to walk or edit,
+and `_collect_paragraphs` skips it silently — so the module registers all three
+as `XmlPart` through `PartFactory.part_type_for` at import.
+
+Register all three explicitly, never only the ones the installed python-docx
+happens to miss. python-docx registers a class for comments from 1.2.0 and
+never for footnotes or endnotes; the supported range starts at 1.1.0, which
+registers none of them. Relying on the library's own registration made comment
+coverage depend on which version pip resolved. `setdefault` keeps a
+library-supplied class when there is one.
+
+Word's `separator` and `continuationSeparator` footnote entries are rule lines,
+not content, and are skipped.
 
 Note the asymmetry: a **complex** field (`w:fldChar` begin / `w:instrText` /
 separate / result / end) keeps its cached result in ordinary `w:r`/`w:t` runs,
@@ -144,6 +151,21 @@ AttributeError, which is the signal to add it rather than to weaken the test.
 the failure mode depend on whatever `pip` resolved that day. Update
 `requirements.txt` whenever runtime dependencies change and
 `requirements-dev.txt` for test dependencies.
+
+**Run the suite against the floor, not just the latest.** The supported range
+is a promise, and the versions in it differ in what they register and what
+their convenience APIs return. A change that works on the newest python-docx
+can silently do nothing on 1.1.0 — that is exactly how comment coverage shipped
+broken once already.
+
+```
+py -m venv .venv-floor
+.venv-floor\Scripts\pip install "python-docx==1.1.0" pytest
+.venv-floor\Scripts\python -m pytest
+```
+
+`test_note_parts_load_as_xml_on_every_supported_version` asserts the
+registration directly, so that particular gap now fails loudly on any version.
 
 ## Documentation
 

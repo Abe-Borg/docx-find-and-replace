@@ -48,12 +48,18 @@ from docx.opc.exceptions import PackageNotFoundError
 from docx.opc.part import PartFactory, XmlPart
 from docx.oxml.ns import qn
 
-# python-docx registers a class for comments but not for footnotes or endnotes,
-# so those load as opaque blobs with no element tree to walk or edit.
+# Footnote, endnote and comment parts must load as XML so their paragraphs can
+# be walked and edited; otherwise they arrive as opaque blobs and are silently
+# skipped. python-docx registers a class for comments from 1.2.0 and never for
+# footnotes or endnotes, so all three are registered here rather than relying on
+# which version pip resolved - the supported range starts at 1.1.0, which
+# registers none of them.
+#
 # `PartFactory.part_type_for` is the documented extension point; setdefault so a
-# future python-docx that registers its own class keeps precedence.
+# python-docx that ships its own class for any of these keeps precedence.
 PartFactory.part_type_for.setdefault(_CT.WML_FOOTNOTES, XmlPart)
 PartFactory.part_type_for.setdefault(_CT.WML_ENDNOTES, XmlPart)
+PartFactory.part_type_for.setdefault(_CT.WML_COMMENTS, XmlPart)
 
 
 # --------------------------------------------------------------------------
