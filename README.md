@@ -31,6 +31,24 @@ Updating technical specifications and building code references across multiple W
 
 ## Installation
 
+### Installer (no Python needed)
+
+Download `DocxFindReplace-Setup-<version>.exe` from the
+[Releases](https://github.com/Abe-Borg/docx-find-and-replace/releases) page and
+run it. It installs for the current user only, so it needs no administrator
+rights on a managed machine, and adds a Start Menu entry plus an uninstaller.
+
+A single-file `DocxFindReplace-Portable.exe` is published alongside it for
+running from a USB stick or a network share without installing anything. It
+starts more slowly than the installed build, because it unpacks itself on each
+launch, and is likelier to be held up by antivirus scanning.
+
+Neither executable is code-signed, so Windows SmartScreen will show a
+"Windows protected your PC" warning the first time. Choose **More info** →
+**Run anyway**.
+
+### From source
+
 ```bash
 cd docx-find-and-replace
 pip install -r requirements.txt
@@ -65,9 +83,20 @@ python main.py
 docx-find-and-replace/
 ├── main.py                 # GUI application (tkinter)
 ├── document_processor.py   # Core scan and replace logic
+├── version.py              # Version and product name, used by app and installer
 ├── requirements.txt        # Runtime dependencies
-├── requirements-dev.txt    # Test dependencies
+├── requirements-dev.txt    # Test and packaging dependencies
 ├── pytest.ini              # Test configuration
+├── LICENSE.txt             # Shown by the installer
+├── packaging/
+│   ├── app.spec            # PyInstaller: one-folder build (wrapped by installer)
+│   ├── app-portable.spec   # PyInstaller: single-file portable build
+│   ├── installer.iss       # Inno Setup installer script
+│   ├── make_version_file.py# Windows file-version resource, from version.py
+│   ├── build.bat           # One-command Windows build
+│   └── icon.ico            # Application icon
+├── .github/workflows/
+│   └── build.yml           # Tests on both python-docx versions, then packages
 ├── tests/
 │   ├── conftest.py         # Fixture builders (hyperlinks, merged cells, images, ...)
 │   ├── test_traversal.py   # Text extraction and paragraph identity
@@ -164,6 +193,50 @@ The GUI is covered too, headlessly. `tests/tkstub.py` is a small tkinter
 stand-in, so `test_gui.py` can exercise the window's decisions — which status
 message is shown, whether a click toggles a checkbox, whether Apply survives an
 error, whether stale results can still be applied — without needing a display.
+
+## Building the Installer
+
+Builds run on Windows. PyInstaller is not a cross-compiler, so a Linux or macOS
+machine cannot produce these artifacts.
+
+```bat
+pip install -r requirements-dev.txt
+packaging\build.bat
+```
+
+`build.bat` runs the test suite first and refuses to package a failing build,
+then produces:
+
+| Output | What it is |
+|---|---|
+| `dist\DocxFindReplace\DocxFindReplace.exe` | Installed build (one folder) |
+| `dist\DocxFindReplace-Portable.exe` | Single-file portable build |
+| `dist\installer\DocxFindReplace-Setup-<version>.exe` | The installer |
+
+The installer step needs [Inno Setup 6](https://jrsoftware.org/isdl.php). If it
+is missing, the executables are still built and only the setup step is skipped.
+
+The same build runs in GitHub Actions on every push and pull request, and
+attaches the installer and portable exe to the GitHub release when a `v*` tag is
+pushed. Version numbers come from `version.py` — bump it there and the
+executable's file properties, the installer, and the output filenames all
+follow.
+
+### Verifying a build
+
+A packaged build can fail in ways the source never does: python-docx's XML
+templates left out of the bundle, or lxml's dynamically resolved imports not
+collected. Neither shows up until the document code actually runs.
+
+Both executables therefore support a headless self-check that performs a real
+find-and-replace on a temporary document and exits non-zero if anything is
+wrong:
+
+```bat
+DocxFindReplace.exe --selftest report.txt
+```
+
+CI runs this against both built executables before the installer is packaged.
 
 ## Known Limitations
 

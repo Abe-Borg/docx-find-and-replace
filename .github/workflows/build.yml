@@ -1,0 +1,143 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (python-docx ${{ matrix.docx }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor and the current release of the supported range. The two
+        # differ in what parts they register and what their convenience APIs
+        # return, and a change that works on one has shipped broken on the other.
+        docx: ["1.1.0", "1.2.0"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "python-docx==${{ matrix.docx }}" pytest
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  build:
+    name: Build installer
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: write        # only used by the release step on a tag
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Read version
+        id: v
+        run: |
+          $version = python -c "import version; print(version.__version__)"
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Building version $version"
+
+      - name: Generate Windows version resource
+        run: python packaging/make_version_file.py
+
+      - name: Build installed (one-folder) app
+        run: python -m PyInstaller packaging/app.spec --noconfirm --clean
+
+      - name: Build portable (one-file) exe
+        run: python -m PyInstaller packaging/app-portable.spec --noconfirm
+
+      # A frozen build fails in ways the source never does - python-docx's XML
+      # templates left out of the bundle, lxml's dynamic imports not collected.
+      # Running the real executable is the only way to catch that here.
+      - name: Verify the installed executable runs
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP "selftest-installed.txt"
+          $p = Start-Process -FilePath "dist\DocxFindReplace\DocxFindReplace.exe" `
+                             -ArgumentList "--selftest", $report -Wait -PassThru
+          if (Test-Path $report) { Get-Content $report | Write-Host }
+          if ($p.ExitCode -ne 0) {
+            throw "Installed build failed its selftest (exit $($p.ExitCode))"
+          }
+
+      - name: Verify the portable executable runs
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP "selftest-portable.txt"
+          $p = Start-Process -FilePath "dist\DocxFindReplace-Portable.exe" `
+                             -ArgumentList "--selftest", $report -Wait -PassThru
+          if (Test-Path $report) { Get-Content $report | Write-Host }
+          if ($p.ExitCode -ne 0) {
+            throw "Portable build failed its selftest (exit $($p.ExitCode))"
+          }
+
+      - name: Ensure Inno Setup is available
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Inno Setup not present on the runner; installing."
+            choco install innosetup --no-progress -y
+          } else {
+            Write-Host "Inno Setup already present."
+          }
+
+      - name: Build installer
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found after install" }
+          & $iscc "/DAppVersion=${{ steps.v.outputs.value }}" packaging\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed ($LASTEXITCODE)" }
+
+      - name: List what was built
+        run: |
+          Get-ChildItem dist\installer, dist\*.exe |
+            Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DocxFindReplace-${{ steps.v.outputs.value }}
+          path: |
+            dist/installer/*.exe
+            dist/DocxFindReplace-Portable.exe
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title $tag --notes "Automated build of $tag."
+          }
+          $files = @((Get-ChildItem dist\installer\*.exe).FullName)
+          $files += (Get-Item dist\DocxFindReplace-Portable.exe).FullName
+          gh release upload $tag $files --clobber

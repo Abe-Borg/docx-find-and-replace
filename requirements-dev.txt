@@ -1,2 +1,9 @@
 -r requirements.txt
+
+# Test suite
 pytest>=7.4,<9.0
+
+# Windows packaging (packaging/build.bat). Installs on any platform, but only
+# produces a usable build when run on Windows - PyInstaller is not a
+# cross-compiler. The installer step additionally needs Inno Setup 6.
+pyinstaller>=6.3,<7.0

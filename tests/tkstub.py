@@ -238,6 +238,10 @@ def install():
     tk.BooleanVar = _Var
     tk.Tk = FakeRoot
     tk.Frame = _Widget
+    # main.selftest() reports these; a frozen build that shipped without Tcl/Tk
+    # would fail on them, which is the point of checking.
+    tk.TkVersion = 8.6
+    tk.TclVersion = 8.6
 
     ttk = types.ModuleType("tkinter.ttk")
     for name in ("Frame", "LabelFrame", "Label", "Entry", "Button",
