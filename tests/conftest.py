@@ -148,6 +148,43 @@ def add_alternate_content_textbox(paragraph, choice_text, fallback_text):
     paragraph._p.addnext(parse_xml(xml))
 
 
+def add_notes_part(doc, kind, texts):
+    """
+    Attach a footnotes / endnotes / comments part containing one note per text.
+
+    `kind` is "footnote", "endnote" or "comment". A separator entry is included
+    for footnotes, mirroring what Word writes, so the traversal has to skip it.
+    """
+    from docx.opc.constants import CONTENT_TYPE as CT
+    from docx.opc.packuri import PackURI
+    from docx.opc.part import XmlPart
+
+    spec = {
+        "footnote": (CT.WML_FOOTNOTES, "footnotes", "/word/footnotes.xml"),
+        "endnote": (CT.WML_ENDNOTES, "endnotes", "/word/endnotes.xml"),
+        "comment": (CT.WML_COMMENTS, "comments", "/word/comments.xml"),
+    }[kind]
+    content_type, root_tag, partname = spec
+    reltype = "%s/%s" % (NS_R, root_tag)
+
+    entries = []
+    if kind == "footnote":
+        entries.append(
+            '<w:footnote w:type="separator" w:id="-1">'
+            '<w:p><w:r><w:separator/></w:r></w:p></w:footnote>'
+        )
+    for i, text in enumerate(texts, start=2):
+        entries.append(
+            '<w:%s w:id="%d"><w:p><w:r><w:t xml:space="preserve">%s</w:t></w:r></w:p></w:%s>'
+            % (kind, i, _escape(text), kind)
+        )
+
+    xml = '<w:%s xmlns:w="%s">%s</w:%s>' % (root_tag, NS_W, "".join(entries), root_tag)
+    part = XmlPart(PackURI(partname), content_type, parse_xml(xml), doc.part.package)
+    doc.part.relate_to(part, reltype)
+    return part
+
+
 def _escape(text):
     return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
@@ -286,6 +323,19 @@ def tracked_changes_doc(docdir):
     add_tracked_insertion(p, "2022 CBC inserted")
     add_deletion(p, " 2022 CBC deleted")
     path = docdir / "tracked.docx"
+    doc.save(str(path))
+    return str(path)
+
+
+@pytest.fixture
+def notes_doc(docdir):
+    """Body plus a footnote, an endnote and a comment, all citing 2022 CBC."""
+    doc = Document()
+    doc.add_paragraph("Body cites 2022 CBC here.")
+    add_notes_part(doc, "footnote", ["Footnote cites 2022 CBC too."])
+    add_notes_part(doc, "endnote", ["Endnote cites 2022 CBC as well."])
+    add_notes_part(doc, "comment", ["Reviewer asks about 2022 CBC."])
+    path = docdir / "notes.docx"
     doc.save(str(path))
     return str(path)
 

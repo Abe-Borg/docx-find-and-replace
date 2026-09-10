@@ -14,7 +14,9 @@ worse than a loud failure.
   all widget updates go back to the main thread via `root.after`.
 - `document_processor.py` — all document logic. No tkinter imports; it is
   independently testable and that is deliberate.
-- `tests/` — pytest suite that builds real `.docx` fixtures on disk.
+- `tests/` — pytest suite that builds real `.docx` fixtures on disk, plus
+  `tkstub.py`, a headless tkinter stand-in that lets `test_gui.py` exercise the
+  window's decisions without a display.
 
 Target platform is Windows. Paths and any shell examples should assume Windows
 even though the code is platform-neutral.
@@ -67,6 +69,19 @@ Do not reintroduce `paragraph.text`, `paragraph.runs`, `doc.paragraphs`,
 7. **Re-verify before editing.** `_replace_in_paragraph` re-reads the paragraph
    and confirms the search text is still at the recorded offset before touching
    anything. Offsets are applied in descending order so earlier ones stay valid.
+8. **Refuse a file that changed since the scan.** Each Match records the file's
+   size and mtime; `_describe_staleness` re-checks both before the file is
+   opened for writing. A stale offset can still validate against different text,
+   so the whole file is refused rather than partially edited. Matches built by
+   hand with no recorded stat skip the check.
+9. **Never read a setting live at apply time.** The GUI stores `scan_find_text`
+   and `scan_case_sensitive` when a scan starts and uses those when applying.
+   Reading the widgets instead would validate offsets found under one setting
+   against another. Changing the folder, search text or case setting discards
+   the on-screen results for the same reason.
+10. **The results tree is inert while a worker runs.** `_on_tree_click`,
+    `_select_all` and `_deselect_all` return early when `is_processing`, because
+    the worker thread reads the same Match objects those handlers mutate.
 
 ## Traversal specifics
 
@@ -84,6 +99,22 @@ text boxes that the inner walk will reach on its own.
 `w:del` and `w:moveFrom` are excluded: that text is already marked deleted and
 must not be edited. `w:fldSimple` is excluded, so its cached result is not
 scanned.
+
+Footnotes, endnotes and comments live in their own parts, reached by
+relationship from the document part (`_NOTE_PARTS`). Any part that is not
+registered as an XML part loads as an opaque blob with nothing to walk or edit,
+and `_collect_paragraphs` skips it silently — so the module registers all three
+as `XmlPart` through `PartFactory.part_type_for` at import.
+
+Register all three explicitly, never only the ones the installed python-docx
+happens to miss. python-docx registers a class for comments from 1.2.0 and
+never for footnotes or endnotes; the supported range starts at 1.1.0, which
+registers none of them. Relying on the library's own registration made comment
+coverage depend on which version pip resolved. `setdefault` keeps a
+library-supplied class when there is one.
+
+Word's `separator` and `continuationSeparator` footnote entries are rule lines,
+not content, and are skipped.
 
 Note the asymmetry: a **complex** field (`w:fldChar` begin / `w:instrText` /
 separate / result / end) keeps its cached result in ordinary `w:r`/`w:t` runs,
@@ -105,8 +136,13 @@ not merely that the call returned without raising. All four Tier 1 bugs returned
 `replaced=1, errors=[]` while destroying content, so a green return value proves
 nothing. `tests/conftest.py` has builders for hyperlinks, merged cells, linked
 headers, images inside a spanned run, nested tables, text boxes (VML and
-`mc:AlternateContent`) and tracked changes; extend it rather than hand-rolling
-XML in a test.
+`mc:AlternateContent`), footnotes/endnotes/comments, complex fields and tracked
+changes; extend it rather than hand-rolling XML in a test.
+
+For GUI work, `tests/test_gui.py` installs `tkstub` **before** importing `main`,
+so the stub must be in place first. The stub is deliberately minimal: a widget
+method `main.py` starts calling that the stub lacks fails loudly with
+AttributeError, which is the signal to add it rather than to weaken the test.
 
 ## Dependencies
 
@@ -115,6 +151,21 @@ XML in a test.
 the failure mode depend on whatever `pip` resolved that day. Update
 `requirements.txt` whenever runtime dependencies change and
 `requirements-dev.txt` for test dependencies.
+
+**Run the suite against the floor, not just the latest.** The supported range
+is a promise, and the versions in it differ in what they register and what
+their convenience APIs return. A change that works on the newest python-docx
+can silently do nothing on 1.1.0 — that is exactly how comment coverage shipped
+broken once already.
+
+```
+py -m venv .venv-floor
+.venv-floor\Scripts\pip install "python-docx==1.1.0" pytest
+.venv-floor\Scripts\python -m pytest
+```
+
+`test_note_parts_load_as_xml_on_every_supported_version` asserts the
+registration directly, so that particular gap now fails loudly on any version.
 
 ## Documentation
 

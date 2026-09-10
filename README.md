@@ -18,6 +18,8 @@ Updating technical specifications and building code references across multiple W
 - **Timestamped backups** — Optional `.bak` files that never overwrite each other, so the true original stays recoverable across repeated runs
 - **Atomic saves** — Documents are written to a temporary file and swapped into place, so an interrupted save cannot truncate the original
 - **Full accounting** — Every selected change is reported as either applied or skipped; a change that could not be applied is never silently dropped
+- **Stale-preview protection** — A document edited in Word between Preview and Apply is refused rather than edited with offsets that no longer describe it
+- **Cancellable scan** — Large batches report progress file by file and can be stopped without waiting for the whole folder
 - **Case sensitivity toggle** — Search with or without case sensitivity
 - **Error handling** — Gracefully skips corrupted, locked, or permission-denied files with clear error messages
 
@@ -49,10 +51,12 @@ python main.py
 1. **Select folder** — Click "Browse..." and choose the folder containing your `.docx` files (non-recursive, skips temp files like `~$*.docx`)
 2. **Enter find/replace text** — Type the text to search for and the replacement text
 3. **Configure options** — Toggle case sensitivity and backup creation
-4. **Preview** — Click "Preview Changes" to scan all documents. Results appear in a tree view:
+4. **Preview** — Click "Preview Changes" to scan all documents. The status bar names each file as it is scanned, and the button becomes "Cancel Scan" so a large batch can be stopped early. Results appear in a tree view:
    - File-level nodes show total match count
-   - Each match shows its location (body/table/header/footer) and surrounding context with the match highlighted in brackets
-5. **Select/deselect** — Click any match to toggle it. Click a file node to toggle all matches in that file. Use "Select All" / "Deselect All" buttons for bulk operations.
+   - Each match shows its location (body/table/header/footer/footnote/endnote/comment) and surrounding context with the match highlighted in brackets
+5. **Select/deselect** — Click any match to toggle it. Click a file node to toggle all matches in that file. Use "Select All" / "Deselect All" buttons for bulk operations. Clicking the expand/collapse arrow only expands; it does not toggle anything.
+
+   Changing the folder, the search text, or the case-sensitivity setting discards the results on screen — they describe offsets found under the old settings, so the preview has to be re-run.
 6. **Apply** — Click "Apply Selected Changes." A confirmation dialog shows the summary before proceeding. The completion dialog reports replacements made, files modified, backups created, and — if any selected change could not be applied — a warning saying how many were skipped.
 
 ## File Structure
@@ -69,7 +73,10 @@ docx-find-and-replace/
 │   ├── test_traversal.py   # Text extraction and paragraph identity
 │   ├── test_replace.py     # Paragraph-level replacement
 │   ├── test_search.py      # Occurrence finding, context, folder scanning
-│   └── test_apply.py       # End-to-end scan → apply, backups, reporting
+│   ├── test_apply.py       # End-to-end scan → apply, backups, reporting
+│   ├── test_coverage.py    # Notes parts, staleness guard, progress and cancel
+│   ├── test_gui.py         # GUI behaviour against the tkinter stub
+│   └── tkstub.py           # Headless tkinter stand-in used by test_gui.py
 └── README.md               # This file
 ```
 
@@ -80,6 +87,7 @@ Scanned and replaced:
 - Body paragraphs
 - Tables, including tables nested inside table cells
 - Headers and footers (default, first-page, and even-page)
+- Footnotes, endnotes and comments
 - Text boxes
 - Text inside hyperlinks
 - Text inside tracked insertions (`w:ins`), smart tags, and content controls
@@ -88,6 +96,7 @@ Scanned and replaced:
 Deliberately not touched:
 
 - Text inside tracked deletions (`w:del`) — this text is already marked for removal
+- Word's footnote separator entries — rule lines, not content
 - Field codes (`w:instrText`) — editing the instruction would break the field
 - Cached results inside `w:fldSimple` — the simple-field form is not descended into
 
@@ -126,6 +135,18 @@ Walking the XML visits each physical `w:tc` and each header *part* exactly once,
 
 Replacements are written directly into `w:t` element text. Assigning to `Run.text` would call `clear_content()`, which strips *every* child of the run — destroying inline images, footnote references, comment anchors and field characters that happen to share a run with the matched text.
 
+### Guarding against a document that changed underneath the preview
+
+A preview records character offsets into one particular version of a file. If
+the document is edited in Word between Preview and Apply, those offsets may
+still *validate* — the search text can happen to sit at the same offset in
+different surrounding prose — and the replacement would land in the wrong place.
+
+Each match therefore records the file's size and modification time at scan time,
+and `apply_changes` re-checks both before opening the file. A file that changed
+is refused whole, reported as an error, and counted as skipped. No backup is
+written for it, because nothing was touched.
+
 ### Why the version floor matters
 
 `python-docx` changed the behaviour of `Paragraph.text` between 0.8.x and 1.1: older versions exclude hyperlink text, newer versions include it. Code that depends on that property behaves differently depending on which version `pip` happened to resolve. This tool reads the XML directly rather than depending on that property, but the floor is pinned at 1.1.0 anyway so that the APIs it does use (`part.related_parts`, `section._sectPr`, part element access) are guaranteed present.
@@ -137,17 +158,21 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The suite builds real `.docx` files on disk for each structure the replacement logic has to get right — hyperlinks, merged cells, headers linked across sections, inline images inside a spanned run, nested tables, text boxes in both VML and `mc:AlternateContent` form, and tracked changes — then asserts on the resulting documents. Each test named after a corruption case asserts the document is left *correct*, not merely that the call returned without raising.
+The suite builds real `.docx` files on disk for each structure the replacement logic has to get right — hyperlinks, merged cells, headers linked across sections, inline images inside a spanned run, nested tables, text boxes in both VML and `mc:AlternateContent` form, footnotes, endnotes, comments, complex fields, and tracked changes — then asserts on the resulting documents. Each test named after a corruption case asserts the document is left *correct*, not merely that the call returned without raising.
+
+The GUI is covered too, headlessly. `tests/tkstub.py` is a small tkinter
+stand-in, so `test_gui.py` can exercise the window's decisions — which status
+message is shown, whether a click toggles a checkbox, whether Apply survives an
+error, whether stale results can still be applied — without needing a display.
 
 ## Known Limitations
 
 - **Non-recursive** — Only processes `.docx` files in the selected folder, not subfolders
 - **No regex** — Find text is matched literally (case-sensitive or case-insensitive)
 - **No undo** — Use the backup feature; there is no built-in undo. Backups are timestamped (`spec.docx.20260909-141530.bak`) and are only created for files that are actually modified. Rename one back to `.docx` to restore it.
-- **Not scanned: footnotes, endnotes and comments** — These live in separate document parts that are not yet traversed
 - **Text box fallback copies** — Word stores a text box twice, as a modern `mc:Choice` copy and a legacy `mc:Fallback` copy. Only the `mc:Choice` copy is replaced, which is what current versions of Word render; the fallback copy retains the old text until Word next re-saves the file
 - **Field results can revert** — Word stores a complex field's cached result (a cross-reference, a table of contents entry) as ordinary text, so it *is* scanned and replaced like any other text. But Word regenerates that text from the field code the next time the field updates, which silently undoes the replacement. For a table of contents, replace the underlying heading text and update the field rather than relying on the cached entry. The field code itself is never touched, and results inside the older `w:fldSimple` form are not scanned at all
-- **Preview can go stale** — If a document is edited in Word between clicking Preview and clicking Apply, the recorded offsets may no longer be valid. Affected changes are skipped rather than misapplied, and the completion dialog reports how many were skipped, but re-running the preview is the reliable move.
+- **Preview can go stale** — If a document is edited in Word between clicking Preview and clicking Apply, the file is refused outright rather than edited with offsets that no longer describe it. The completion dialog names the file and reports the skipped changes; re-run the preview to pick up the new content. Detection is by file size and modification time, so an edit that changes neither would go unnoticed.
 - **Single-pass matching** — Replacement text is not re-scanned, so replacing "2022" with "2022 and 2025" applies exactly once per original occurrence
 
 ## Copyright Notice
