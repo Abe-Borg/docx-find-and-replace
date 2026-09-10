@@ -12,11 +12,13 @@ same Match objects the tree would mutate.
 """
 
 import os
+import sys
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from document_processor import scan_documents_detailed, apply_changes, FileResult, Match
 from typing import List, Optional
+from version import APP_NAME, __version__
 
 
 # Prefix shown before each match's location in the results tree.
@@ -40,7 +42,7 @@ class FindReplaceApp:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Word Document Find & Replace")
+        self.root.title(f"{APP_NAME} {__version__}")
         self.root.geometry("900x700")
         self.root.minsize(700, 500)
 
@@ -596,7 +598,77 @@ class FindReplaceApp:
         self.root.destroy()
 
 
+def selftest(report_path: Optional[str] = None) -> int:
+    """
+    Prove a packaged build works end to end, without opening a window.
+
+    Run as `DocxFindReplace.exe --selftest`. A frozen build fails in ways the
+    source never does - python-docx's XML templates left out of the bundle,
+    lxml's dynamically resolved imports not collected - and those only surface
+    once the document code actually runs. The CI build runs this against the
+    real executable so a broken bundle cannot be shipped.
+
+    Writes a report to `report_path` when given, because a windowed executable
+    has no console to print to.
+    """
+    import tempfile
+    import traceback
+
+    lines = [f"{APP_NAME} {__version__}", f"frozen: {getattr(sys, 'frozen', False)}"]
+    ok = True
+
+    try:
+        from docx import Document
+        import document_processor as dp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "selftest.docx")
+            # Document() with no argument loads python-docx's default template,
+            # which is exactly the bundled data the frozen build tends to miss.
+            doc = Document()
+            doc.add_paragraph("Reference the 2022 CBC for compliance.")
+            doc.save(path)
+
+            matches = [m for r in dp.scan_documents(tmp, "2022 CBC", True)
+                       for m in r.matches]
+            if len(matches) != 1:
+                raise AssertionError(f"expected 1 match, got {len(matches)}")
+
+            result = dp.apply_changes(matches, "2025 CBC", create_backups=False)
+            if result["total_replaced"] != 1:
+                raise AssertionError(f"expected 1 replacement, got {result}")
+
+            reloaded = dp._collect_paragraphs(Document(path))[0][0]
+            text = dp.paragraph_text(reloaded)
+            if text != "Reference the 2025 CBC for compliance.":
+                raise AssertionError(f"unexpected text: {text!r}")
+
+        lines.append(f"document engine OK -> {text!r}")
+        lines.append(f"tkinter OK -> Tk {tk.TkVersion}")
+        lines.append("SELFTEST PASSED")
+    except Exception:
+        ok = False
+        lines.append("SELFTEST FAILED")
+        lines.append(traceback.format_exc())
+
+    report = "\n".join(lines)
+    print(report)
+
+    if report_path:
+        try:
+            with open(report_path, "w", encoding="utf-8") as fh:
+                fh.write(report + "\n")
+        except OSError:
+            pass
+
+    return 0 if ok else 1
+
+
 def main():
+    if "--selftest" in sys.argv:
+        after = sys.argv[sys.argv.index("--selftest") + 1:]
+        sys.exit(selftest(after[0] if after else None))
+
     # DPI awareness has to be set before the first Tk window exists, otherwise
     # Tk has already sampled the old DPI and the UI stays blurry on high-DPI
     # displays.

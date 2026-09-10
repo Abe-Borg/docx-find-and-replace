@@ -321,3 +321,41 @@ def test_results_survive_a_scan_that_completes_after_a_close_request(app):
     assert app.root.destroyed is True
     assert len(app.all_matches) == 1        # populated before the window went away
     assert "cancelled after 1 file" in app.progress_var.get()
+
+
+# ----------------------------------------------------- packaged-build selftest
+
+def test_selftest_passes_and_reports(tmp_path):
+    """
+    `--selftest` is what CI runs against the built .exe to prove the frozen
+    bundle actually works. If the check itself is broken, a packaging failure
+    would look like a passing build.
+    """
+    report = tmp_path / "selftest.txt"
+    assert main.selftest(str(report)) == 0
+
+    text = report.read_text(encoding="utf-8")
+    assert "SELFTEST PASSED" in text
+    assert "document engine OK" in text
+    assert main.__version__ in text
+
+
+def test_selftest_needs_no_report_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert main.selftest() == 0
+
+
+def test_selftest_reports_failure_rather_than_raising(monkeypatch, tmp_path):
+    """A broken bundle must produce a non-zero exit, not an unhandled crash."""
+    import document_processor as dp_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("python-docx templates missing from the bundle")
+
+    monkeypatch.setattr(dp_mod, "scan_documents", boom)
+    report = tmp_path / "fail.txt"
+
+    assert main.selftest(str(report)) == 1
+    text = report.read_text(encoding="utf-8")
+    assert "SELFTEST FAILED" in text
+    assert "templates missing from the bundle" in text

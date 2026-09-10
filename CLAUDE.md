@@ -17,6 +17,11 @@ worse than a loud failure.
 - `tests/` — pytest suite that builds real `.docx` fixtures on disk, plus
   `tkstub.py`, a headless tkinter stand-in that lets `test_gui.py` exercise the
   window's decisions without a display.
+- `version.py` — the one place the version lives. The GUI title, the Windows
+  file-version resource, the installer and the output filenames all read it.
+- `packaging/` — PyInstaller specs, the Inno Setup script and `build.bat`.
+- `.github/workflows/build.yml` — runs the suite against both ends of the
+  supported python-docx range, then packages.
 
 Target platform is Windows. Paths and any shell examples should assume Windows
 even though the code is platform-neutral.
@@ -166,6 +171,48 @@ py -m venv .venv-floor
 
 `test_note_parts_load_as_xml_on_every_supported_version` asserts the
 registration directly, so that particular gap now fails loudly on any version.
+
+## Packaging
+
+Builds are Windows-only; PyInstaller does not cross-compile. There is no way to
+produce or test these artifacts from a Linux container, so **the CI workflow is
+the verification** — do not hand over build config that has not gone green there.
+
+A frozen build breaks in ways the source never does. python-docx loads XML
+templates from its package directory and lxml resolves some imports
+dynamically, and PyInstaller sees neither from the import graph:
+`collect_data_files("docx")` and the `lxml._elementpath` hidden import in both
+specs exist for that reason. Removing either produces a build that starts fine
+and then fails the moment a document is opened.
+
+`main.py --selftest [report]` is the guard: it runs a real find-and-replace on a
+temporary document, imports tkinter, writes a report and exits non-zero on
+failure. The workflow runs it against **both built executables** before
+packaging. A windowed executable has no console, hence the report file. If you
+change what the packaged build depends on, extend the selftest to cover it —
+otherwise CI will keep passing while the shipped exe is broken.
+
+Other things worth not relearning:
+
+- `.gitignore` carries `*.spec` from the standard Python template, which would
+  silently swallow `packaging/*.spec`. The `!packaging/*.spec` negation keeps
+  the build config tracked; do not remove it.
+- Builds are one-folder for the installer and one-file only for the portable
+  exe. One-file self-extracts on every launch, which is slower and draws more
+  antivirus attention. UPX is off for the same reason.
+- The installer is per-user (`PrivilegesRequired=lowest`) so it needs no
+  administrator rights on a managed corporate machine. Do not "fix" this to a
+  Program Files install.
+- Never change `AppId` in `installer.iss`. It is how Windows tells an upgrade
+  from a second copy; changing it strands the installed version.
+- Bump the version in `version.py` only. Nothing else should hard-code it.
+- A release tag must match `version.py`. Everything that names or stamps a
+  binary reads `version.py`, but the release is created from the pushed tag,
+  and nothing else reconciles them — a `v1.1.0` tag pushed against a 1.0.0
+  `version.py` would publish a release labelled 1.1.0 containing binaries
+  stamped 1.0.0. `packaging/check_tag.py` fails the build before anything is
+  built; it is plain Python precisely so it can be tested here rather than
+  trusted because it reads well in YAML.
 
 ## Documentation
 
