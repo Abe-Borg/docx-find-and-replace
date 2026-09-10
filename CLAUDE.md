@@ -14,7 +14,9 @@ worse than a loud failure.
   all widget updates go back to the main thread via `root.after`.
 - `document_processor.py` — all document logic. No tkinter imports; it is
   independently testable and that is deliberate.
-- `tests/` — pytest suite that builds real `.docx` fixtures on disk.
+- `tests/` — pytest suite that builds real `.docx` fixtures on disk, plus
+  `tkstub.py`, a headless tkinter stand-in that lets `test_gui.py` exercise the
+  window's decisions without a display.
 
 Target platform is Windows. Paths and any shell examples should assume Windows
 even though the code is platform-neutral.
@@ -67,6 +69,19 @@ Do not reintroduce `paragraph.text`, `paragraph.runs`, `doc.paragraphs`,
 7. **Re-verify before editing.** `_replace_in_paragraph` re-reads the paragraph
    and confirms the search text is still at the recorded offset before touching
    anything. Offsets are applied in descending order so earlier ones stay valid.
+8. **Refuse a file that changed since the scan.** Each Match records the file's
+   size and mtime; `_describe_staleness` re-checks both before the file is
+   opened for writing. A stale offset can still validate against different text,
+   so the whole file is refused rather than partially edited. Matches built by
+   hand with no recorded stat skip the check.
+9. **Never read a setting live at apply time.** The GUI stores `scan_find_text`
+   and `scan_case_sensitive` when a scan starts and uses those when applying.
+   Reading the widgets instead would validate offsets found under one setting
+   against another. Changing the folder, search text or case setting discards
+   the on-screen results for the same reason.
+10. **The results tree is inert while a worker runs.** `_on_tree_click`,
+    `_select_all` and `_deselect_all` return early when `is_processing`, because
+    the worker thread reads the same Match objects those handlers mutate.
 
 ## Traversal specifics
 
@@ -84,6 +99,15 @@ text boxes that the inner walk will reach on its own.
 `w:del` and `w:moveFrom` are excluded: that text is already marked deleted and
 must not be edited. `w:fldSimple` is excluded, so its cached result is not
 scanned.
+
+Footnotes, endnotes and comments live in their own parts, reached by
+relationship from the document part (`_NOTE_PARTS`). python-docx registers a
+class for comments but not for footnotes or endnotes, so those would load as
+opaque blobs with nothing to walk or edit; the module registers them as
+`XmlPart` through `PartFactory.part_type_for` at import. That is the documented
+extension point — use `setdefault` so a future python-docx that ships its own
+class keeps precedence. Word's `separator` and `continuationSeparator` footnote
+entries are rule lines, not content, and are skipped.
 
 Note the asymmetry: a **complex** field (`w:fldChar` begin / `w:instrText` /
 separate / result / end) keeps its cached result in ordinary `w:r`/`w:t` runs,
@@ -105,8 +129,13 @@ not merely that the call returned without raising. All four Tier 1 bugs returned
 `replaced=1, errors=[]` while destroying content, so a green return value proves
 nothing. `tests/conftest.py` has builders for hyperlinks, merged cells, linked
 headers, images inside a spanned run, nested tables, text boxes (VML and
-`mc:AlternateContent`) and tracked changes; extend it rather than hand-rolling
-XML in a test.
+`mc:AlternateContent`), footnotes/endnotes/comments, complex fields and tracked
+changes; extend it rather than hand-rolling XML in a test.
+
+For GUI work, `tests/test_gui.py` installs `tkstub` **before** importing `main`,
+so the stub must be in place first. The stub is deliberately minimal: a widget
+method `main.py` starts calling that the stub lacks fails loudly with
+AttributeError, which is the signal to add it rather than to weaken the test.
 
 ## Dependencies
 

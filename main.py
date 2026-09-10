@@ -4,15 +4,35 @@ Word Document Batch Find & Replace - GUI Application
 
 A tkinter-based GUI for performing batch find-and-replace operations
 across multiple Word documents (.docx) with a preview-before-commit workflow.
+
+Threading model: scanning and applying run on daemon worker threads; every
+widget update is marshalled back to the main thread with `root.after`. The
+results tree is inert while a worker is running, because the worker reads the
+same Match objects the tree would mutate.
 """
 
 import os
-import sys
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from document_processor import scan_documents_detailed, apply_changes, FileResult, Match
-from typing import List
+from typing import List, Optional
+
+
+# Prefix shown before each match's location in the results tree.
+LOCATION_PREFIXES = {
+    'table': '[Table] ',
+    'header': '[Header] ',
+    'footer': '[Footer] ',
+    'footnote': '[Footnote] ',
+    'endnote': '[Endnote] ',
+    'comment': '[Comment] ',
+}
+
+CHECKED = "☑"      # ☑
+UNCHECKED = "☐"    # ☐
+PARTIAL = "☒"      # ☒
+WARNING = "⚠"      # ⚠
 
 
 class FindReplaceApp:
@@ -27,10 +47,19 @@ class FindReplaceApp:
         # State
         self.scan_results: List[FileResult] = []
         self.all_matches: List[Match] = []
-        self.match_tree_map = {}  # tree item id -> Match object
-        self.file_tree_map = {}   # tree item id -> FileResult object
-        self.has_previewed = False
-        self.is_processing = False
+        self.match_tree_map = {}   # tree item id -> Match object
+        self.file_tree_map = {}    # tree item id -> FileResult object
+
+        # 'scan', 'apply', or None. Guards the tree and the close button.
+        self.processing_kind: Optional[str] = None
+        self.scan_cancel: Optional[threading.Event] = None
+        self.close_when_idle = False
+
+        # The settings the current results were produced with. Apply uses these
+        # rather than reading the widgets live, so a setting changed after the
+        # preview cannot be applied to offsets found under the old one.
+        self.scan_find_text = ""
+        self.scan_case_sensitive = True
 
         # Configure styles
         style = ttk.Style()
@@ -39,6 +68,16 @@ class FindReplaceApp:
         style.configure("Status.TLabel", font=("Segoe UI", 9))
 
         self._build_ui()
+
+        # Changing what gets searched invalidates the results that are on screen.
+        for var in (self.folder_var, self.find_var, self.case_var):
+            var.trace_add("write", self._on_search_settings_changed)
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    @property
+    def is_processing(self) -> bool:
+        return self.processing_kind is not None
 
     def _build_ui(self):
         """Build the complete GUI layout."""
@@ -56,7 +95,8 @@ class FindReplaceApp:
         self.folder_var = tk.StringVar()
         self.folder_entry = ttk.Entry(folder_frame, textvariable=self.folder_var)
         self.folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        ttk.Button(folder_frame, text="Browse...", command=self._browse_folder).pack(side=tk.LEFT)
+        self.browse_btn = ttk.Button(folder_frame, text="Browse...", command=self._browse_folder)
+        self.browse_btn.pack(side=tk.LEFT)
 
         # Find row
         find_frame = ttk.Frame(input_frame)
@@ -97,8 +137,10 @@ class FindReplaceApp:
         # Toolbar for select all / deselect all
         toolbar = ttk.Frame(results_frame)
         toolbar.pack(fill=tk.X, pady=(0, 4))
-        ttk.Button(toolbar, text="Select All", command=self._select_all).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(toolbar, text="Deselect All", command=self._deselect_all).pack(side=tk.LEFT)
+        self.select_all_btn = ttk.Button(toolbar, text="Select All", command=self._select_all)
+        self.select_all_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self.deselect_all_btn = ttk.Button(toolbar, text="Deselect All", command=self._deselect_all)
+        self.deselect_all_btn.pack(side=tk.LEFT)
         self.match_count_label = ttk.Label(toolbar, text="", style="Status.TLabel")
         self.match_count_label.pack(side=tk.RIGHT)
 
@@ -106,11 +148,8 @@ class FindReplaceApp:
         tree_frame = ttk.Frame(results_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.tree = ttk.Treeview(tree_frame, columns=("status", "context"), show="tree",
-                                  selectmode="browse")
+        self.tree = ttk.Treeview(tree_frame, show="tree", selectmode="browse")
         self.tree.column("#0", width=350, minwidth=200)
-        self.tree.column("status", width=0, stretch=False)
-        self.tree.column("context", width=0, stretch=False)
 
         # Scrollbars
         v_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
@@ -139,6 +178,10 @@ class FindReplaceApp:
                                        style="Status.TLabel")
         self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+    # ------------------------------------------------------------------
+    # Input handling
+    # ------------------------------------------------------------------
+
     def _browse_folder(self):
         """Open folder selection dialog."""
         folder = filedialog.askdirectory(title="Select folder containing .docx files")
@@ -161,49 +204,91 @@ class FindReplaceApp:
             return False
         return True
 
+    def _on_search_settings_changed(self, *_args):
+        """
+        Discard on-screen results when the search settings change.
+
+        The results describe offsets found with one folder, search term and case
+        setting. Applying them under different settings would validate old
+        offsets against new rules, so the preview is invalidated instead.
+        """
+        if self.is_processing or not self.all_matches:
+            return
+        self._clear_results()
+        self.progress_var.set("Search settings changed - run Preview Changes again")
+
+    def _clear_results(self):
+        """Drop the current results and the tree showing them."""
+        self.tree.delete(*self.tree.get_children())
+        self.match_tree_map.clear()
+        self.file_tree_map.clear()
+        self.all_matches.clear()
+        self.scan_results = []
+        self.apply_btn.configure(state=tk.DISABLED)
+        self.match_count_label.configure(text="")
+
+    # ------------------------------------------------------------------
+    # Preview
+    # ------------------------------------------------------------------
+
     def _start_preview(self):
         """Start the preview scan in a background thread."""
         if not self._validate_inputs():
             return
 
-        self.is_processing = True
-        self.preview_btn.configure(state=tk.DISABLED)
-        self.apply_btn.configure(state=tk.DISABLED)
+        self.processing_kind = 'scan'
+        self.scan_cancel = threading.Event()
+
+        # Record what this scan is being run with; apply uses these, not the
+        # live widgets.
+        self.scan_find_text = self.find_var.get()
+        self.scan_case_sensitive = self.case_var.get()
+
+        self._clear_results()
         self.progress_var.set("Scanning documents...")
-        self.tree.delete(*self.tree.get_children())
-        self.match_tree_map.clear()
-        self.file_tree_map.clear()
-        self.all_matches.clear()
+        self.preview_btn.configure(text="Cancel Scan", command=self._cancel_scan)
+        self._set_controls_enabled(False)
 
         thread = threading.Thread(target=self._run_preview, daemon=True)
         thread.start()
 
+    def _cancel_scan(self):
+        """Ask the running scan to stop after the file it is on."""
+        if self.scan_cancel is not None:
+            self.scan_cancel.set()
+            self.progress_var.set("Cancelling scan...")
+            self.preview_btn.configure(state=tk.DISABLED)
+
     def _run_preview(self):
         """Background thread: scan documents."""
         folder = self.folder_var.get().strip()
-        find_text = self.find_var.get()
-        case_sensitive = self.case_var.get()
+        find_text = self.scan_find_text
+        case_sensitive = self.scan_case_sensitive
+        cancel = self.scan_cancel
+
+        def progress(file_name, idx, total):
+            self.root.after(0, self.progress_var.set,
+                            f"Scanning {file_name} ({idx + 1}/{total})...")
 
         try:
-            results, summary = scan_documents_detailed(folder, find_text, case_sensitive)
+            results, summary = scan_documents_detailed(
+                folder, find_text, case_sensitive,
+                progress_callback=progress, cancel_event=cancel,
+            )
             self.root.after(0, self._display_results, results, summary)
         except Exception as e:
             self.root.after(0, self._preview_error, str(e))
 
     def _preview_error(self, error_msg: str):
         """Handle preview errors on main thread."""
-        self.is_processing = False
-        self.preview_btn.configure(state=tk.NORMAL)
         self.progress_var.set("Error during scan")
         messagebox.showerror("Scan Error", f"An error occurred:\n{error_msg}")
+        self._finish_processing()
 
     def _display_results(self, results: List[FileResult], summary: dict):
         """Populate the treeview with scan results (main thread)."""
         self.scan_results = results
         self.all_matches.clear()
-        self.has_previewed = True
-        self.is_processing = False
-        self.preview_btn.configure(state=tk.NORMAL)
 
         total_matches = 0
         total_files = 0
@@ -211,11 +296,11 @@ class FindReplaceApp:
         for fr in results:
             # File-level node
             if fr.error:
-                label = f"\u26A0 {fr.file_name} - ERROR: {fr.error}"
+                label = f"{WARNING} {fr.file_name} - ERROR: {fr.error}"
                 file_node = self.tree.insert("", tk.END, text=label)
             else:
-                check = "\u2611"  # ☑
-                label = f"{check} {fr.file_name} ({fr.match_count} match{'es' if fr.match_count != 1 else ''})"
+                label = (f"{CHECKED} {fr.file_name} "
+                         f"({fr.match_count} match{'es' if fr.match_count != 1 else ''})")
                 file_node = self.tree.insert("", tk.END, text=label)
                 self.file_tree_map[file_node] = fr
                 total_files += 1
@@ -223,64 +308,79 @@ class FindReplaceApp:
                 for match in fr.matches:
                     self.all_matches.append(match)
                     total_matches += 1
-
-                    loc_prefix = ""
-                    if match.location_type == 'table':
-                        loc_prefix = f"[Table] "
-                    elif match.location_type == 'header':
-                        loc_prefix = f"[Header] "
-                    elif match.location_type == 'footer':
-                        loc_prefix = f"[Footer] "
-
-                    m_check = "\u2611" if match.is_selected else "\u2610"
-                    m_label = f"{m_check} {loc_prefix}{match.location_detail}: {match.display_context}"
-                    match_node = self.tree.insert(file_node, tk.END, text=m_label)
+                    match_node = self.tree.insert(file_node, tk.END,
+                                                  text=self._match_label(match))
                     self.match_tree_map[match_node] = match
 
             # Expand file nodes
             self.tree.item(file_node, open=True)
 
+        scanned = summary.get('files_scanned', 0)
+        cancelled = summary.get('cancelled', False)
+
         if total_matches > 0:
             self.apply_btn.configure(state=tk.NORMAL)
-            self.progress_var.set(f"Found {total_matches} match{'es' if total_matches != 1 else ''} "
-                                   f"in {total_files} file{'s' if total_files != 1 else ''}")
-        elif summary.get('files_scanned', 0) == 0:
+            status = (f"Found {total_matches} match{'es' if total_matches != 1 else ''} "
+                      f"in {total_files} file{'s' if total_files != 1 else ''}")
+            if cancelled:
+                status += f" - scan cancelled after {scanned} file{'s' if scanned != 1 else ''}"
+            self.progress_var.set(status)
+        elif cancelled:
+            self.progress_var.set(
+                f"Scan cancelled after {scanned} file{'s' if scanned != 1 else ''}"
+            )
+        elif scanned == 0:
             self.progress_var.set("No .docx files found in the selected folder")
         else:
-            scanned = summary['files_scanned']
             self.progress_var.set(
                 f"No matches found in {scanned} .docx file{'s' if scanned != 1 else ''}"
             )
 
-        self._update_match_count()
+        # Last: this may destroy the window if a close was requested mid-scan.
+        self._finish_processing()
+
+    # ------------------------------------------------------------------
+    # Results tree
+    # ------------------------------------------------------------------
+
+    def _match_label(self, match: Match) -> str:
+        """The tree row for one match: checkbox, location, context."""
+        check = CHECKED if match.is_selected else UNCHECKED
+        prefix = LOCATION_PREFIXES.get(match.location_type, "")
+        return f"{check} {prefix}{match.location_detail}: {match.display_context}"
 
     def _on_tree_click(self, event):
         """Handle clicks to toggle checkboxes."""
+        # The worker thread reads the same Match objects, so the tree is inert
+        # while a scan or apply is running.
+        if self.is_processing:
+            return "break"
+
+        # Clicking the expand/collapse arrow must expand, not toggle every
+        # checkbox in the file.
+        if self.tree.identify_element(event.x, event.y) == "Treeitem.indicator":
+            return
+
         item = self.tree.identify_row(event.y)
         if not item:
             return
 
-        # Check if it's a match-level item
         if item in self.match_tree_map:
             match = self.match_tree_map[item]
             match.is_selected = not match.is_selected
             self._refresh_item_label(item, match)
-            # Update parent file node
             parent = self.tree.parent(item)
             if parent in self.file_tree_map:
                 self._refresh_file_label(parent)
 
-        # Check if it's a file-level item
         elif item in self.file_tree_map:
             fr = self.file_tree_map[item]
             # Toggle: if all selected, deselect all; otherwise select all
-            all_selected = all(m.is_selected for m in fr.matches)
-            new_state = not all_selected
+            new_state = not all(m.is_selected for m in fr.matches)
 
             for m in fr.matches:
                 m.is_selected = new_state
 
-            # Refresh all child items
             for child in self.tree.get_children(item):
                 if child in self.match_tree_map:
                     self._refresh_item_label(child, self.match_tree_map[child])
@@ -291,18 +391,7 @@ class FindReplaceApp:
 
     def _refresh_item_label(self, item: str, match: Match):
         """Update a match item's label to reflect its checkbox state."""
-        check = "\u2611" if match.is_selected else "\u2610"
-
-        loc_prefix = ""
-        if match.location_type == 'table':
-            loc_prefix = "[Table] "
-        elif match.location_type == 'header':
-            loc_prefix = "[Header] "
-        elif match.location_type == 'footer':
-            loc_prefix = "[Footer] "
-
-        label = f"{check} {loc_prefix}{match.location_detail}: {match.display_context}"
-        self.tree.item(item, text=label)
+        self.tree.item(item, text=self._match_label(match))
 
     def _refresh_file_label(self, item: str):
         """Update a file item's label to reflect its children's state."""
@@ -311,13 +400,14 @@ class FindReplaceApp:
         total = fr.match_count
 
         if selected == total:
-            check = "\u2611"
+            check = CHECKED
         elif selected == 0:
-            check = "\u2610"
+            check = UNCHECKED
         else:
-            check = "\u2612"  # ☒ (partial)
+            check = PARTIAL
 
-        label = f"{check} {fr.file_name} ({total} match{'es' if total != 1 else ''}, {selected} selected)"
+        label = (f"{check} {fr.file_name} "
+                 f"({total} match{'es' if total != 1 else ''}, {selected} selected)")
         self.tree.item(item, text=label)
 
     def _update_match_count(self):
@@ -326,13 +416,14 @@ class FindReplaceApp:
         selected = sum(1 for m in self.all_matches if m.is_selected)
         self.match_count_label.configure(text=f"{selected} of {total} selected")
 
-        if selected > 0:
-            self.apply_btn.configure(state=tk.NORMAL)
-        else:
-            self.apply_btn.configure(state=tk.DISABLED)
+        if self.is_processing:
+            return
+        self.apply_btn.configure(state=tk.NORMAL if selected > 0 else tk.DISABLED)
 
     def _select_all(self):
         """Select all matches."""
+        if self.is_processing:
+            return
         for m in self.all_matches:
             m.is_selected = True
         self._refresh_all_labels()
@@ -340,6 +431,8 @@ class FindReplaceApp:
 
     def _deselect_all(self):
         """Deselect all matches."""
+        if self.is_processing:
+            return
         for m in self.all_matches:
             m.is_selected = False
         self._refresh_all_labels()
@@ -352,31 +445,59 @@ class FindReplaceApp:
         for item in self.file_tree_map:
             self._refresh_file_label(item)
 
+    # ------------------------------------------------------------------
+    # Apply
+    # ------------------------------------------------------------------
+
+    def _set_controls_enabled(self, enabled: bool):
+        """Enable or disable everything that must not be touched mid-run."""
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for widget in (self.apply_btn, self.browse_btn,
+                       self.select_all_btn, self.deselect_all_btn,
+                       self.folder_entry, self.find_entry, self.replace_entry):
+            widget.configure(state=state)
+
+    def _finish_processing(self):
+        """Return the UI to its idle state after a scan or apply."""
+        self.processing_kind = None
+        self.scan_cancel = None
+        self.preview_btn.configure(text="Preview Changes",
+                                   command=self._start_preview, state=tk.NORMAL)
+        self._set_controls_enabled(True)
+        self._update_match_count()
+
+        # The user asked to quit while a scan was running; the scan has now
+        # stopped, so honour it.
+        if self.close_when_idle:
+            self.root.destroy()
+
     def _start_apply(self):
         """Start applying changes in a background thread."""
         replace_text = self.replace_var.get()
-        selected_count = sum(1 for m in self.all_matches if m.is_selected)
-        file_count = len(set(m.file_path for m in self.all_matches if m.is_selected))
+        selected = [m for m in self.all_matches if m.is_selected]
+        file_count = len(set(m.file_path for m in selected))
 
-        if selected_count == 0:
+        if not selected:
             messagebox.showinfo("Nothing to Apply", "No changes are selected.")
             return
 
         confirm = messagebox.askyesno(
             "Confirm Changes",
-            f"Apply {selected_count} replacement{'s' if selected_count != 1 else ''} "
+            f"Apply {len(selected)} replacement{'s' if len(selected) != 1 else ''} "
             f"across {file_count} file{'s' if file_count != 1 else ''}?\n\n"
-            f"Find: \"{self.find_var.get()}\"\n"
+            # The term actually scanned, which is what these offsets belong to.
+            f"Find: \"{self.scan_find_text}\"\n"
             f"Replace: \"{replace_text}\"\n"
+            f"Case sensitive: {'yes' if self.scan_case_sensitive else 'no'}\n"
             f"{'Backups will be created.' if self.backup_var.get() else 'NO backups will be created!'}"
         )
 
         if not confirm:
             return
 
-        self.is_processing = True
-        self.apply_btn.configure(state=tk.DISABLED)
+        self.processing_kind = 'apply'
         self.preview_btn.configure(state=tk.DISABLED)
+        self._set_controls_enabled(False)
 
         thread = threading.Thread(target=self._run_apply, daemon=True)
         thread.start()
@@ -385,7 +506,9 @@ class FindReplaceApp:
         """Background thread: apply changes."""
         replace_text = self.replace_var.get()
         create_backups = self.backup_var.get()
-        case_sensitive = self.case_var.get()
+        # The setting the offsets were found under, not whatever the checkbox
+        # says now.
+        case_sensitive = self.scan_case_sensitive
 
         def progress(file_name, idx, total):
             self.root.after(0, self.progress_var.set,
@@ -404,10 +527,7 @@ class FindReplaceApp:
 
     def _apply_complete(self, result: dict):
         """Handle apply completion on main thread."""
-        self.is_processing = False
-        self.preview_btn.configure(state=tk.NORMAL)
-        self.has_previewed = False
-
+        self.processing_kind = None
         skipped = result.get('total_skipped', 0)
 
         msg = (f"Completed!\n\n"
@@ -420,7 +540,7 @@ class FindReplaceApp:
         if skipped:
             # A selected match that could not be applied must never disappear
             # quietly - the preview promised it would be changed.
-            msg += (f"\n\n\u26A0 {skipped} selected "
+            msg += (f"\n\n{WARNING} {skipped} selected "
                     f"{'change was' if skipped == 1 else 'changes were'} NOT applied.\n"
                     f"The document may have been edited since the preview. "
                     f"Re-run Preview Changes to see the current state.")
@@ -434,36 +554,69 @@ class FindReplaceApp:
                   f"in {result['files_modified']} files")
         if skipped:
             status += f" ({skipped} skipped)"
+
+        # Results describe the pre-edit documents, so they are stale now.
+        self._clear_results()
         self.progress_var.set(status)
+        self._finish_processing()
 
         messagebox.showinfo("Changes Applied", msg)
 
-        # Clear the tree since results are now stale
-        self.tree.delete(*self.tree.get_children())
-        self.match_tree_map.clear()
-        self.file_tree_map.clear()
-        self.all_matches.clear()
-        self.apply_btn.configure(state=tk.DISABLED)
-
     def _apply_error(self, error_msg: str):
         """Handle apply errors on main thread."""
-        self.is_processing = False
-        self.preview_btn.configure(state=tk.NORMAL)
+        # Keep the results on screen so the run can be retried without
+        # re-scanning.
         self.progress_var.set("Error during apply")
+        self._finish_processing()
         messagebox.showerror("Apply Error", f"An error occurred:\n{error_msg}")
+
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
+
+    def _on_close(self):
+        """Refuse to close while a worker thread is mid-run."""
+        if self.processing_kind == 'apply':
+            messagebox.showwarning(
+                "Apply in Progress",
+                "Documents are being written right now.\n\n"
+                "Closing would interrupt the run and leave part of the batch "
+                "unmodified. Please wait for it to finish."
+            )
+            return
+
+        if self.processing_kind == 'scan':
+            if not messagebox.askyesno("Scan in Progress",
+                                       "A scan is still running. Cancel it and quit?"):
+                return
+            self.close_when_idle = True
+            self._cancel_scan()
+            return
+
+        self.root.destroy()
 
 
 def main():
-    root = tk.Tk()
-
-    # Set DPI awareness for crisp text on Windows
+    # DPI awareness has to be set before the first Tk window exists, otherwise
+    # Tk has already sampled the old DPI and the UI stays blurry on high-DPI
+    # displays.
+    scaling = None
     try:
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)
+        scaling = windll.user32.GetDpiForSystem() / 72.0
     except Exception:
         pass
 
-    app = FindReplaceApp(root)
+    root = tk.Tk()
+
+    if scaling:
+        try:
+            root.tk.call("tk", "scaling", scaling)
+        except Exception:
+            pass
+
+    FindReplaceApp(root)
     root.mainloop()
 
 

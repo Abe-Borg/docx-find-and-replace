@@ -26,9 +26,14 @@ inline images, footnote references, comment anchors and field characters that
 happen to share a run with matched text.
 
 Covered content: body paragraphs, tables (including nested tables), text boxes,
-headers and footers. Text inside hyperlinks, tracked insertions (``w:ins``),
-smart tags and content controls is included. See README "Known Limitations" for
-what is deliberately not covered.
+headers and footers, footnotes, endnotes and comments. Text inside hyperlinks,
+tracked insertions (``w:ins``), smart tags and content controls is included. See
+README "Known Limitations" for what is deliberately not covered.
+
+Offsets recorded by a scan describe one version of a file. `apply_changes`
+re-checks each file's size and mtime before touching it and refuses a file that
+changed in between, because a stale offset can still validate against different
+text.
 """
 
 import os
@@ -38,8 +43,17 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from docx import Document
+from docx.opc.constants import CONTENT_TYPE as _CT
 from docx.opc.exceptions import PackageNotFoundError
+from docx.opc.part import PartFactory, XmlPart
 from docx.oxml.ns import qn
+
+# python-docx registers a class for comments but not for footnotes or endnotes,
+# so those load as opaque blobs with no element tree to walk or edit.
+# `PartFactory.part_type_for` is the documented extension point; setdefault so a
+# future python-docx that registers its own class keeps precedence.
+PartFactory.part_type_for.setdefault(_CT.WML_FOOTNOTES, XmlPart)
+PartFactory.part_type_for.setdefault(_CT.WML_ENDNOTES, XmlPart)
 
 
 # --------------------------------------------------------------------------
@@ -60,6 +74,19 @@ def _mc(tag: str) -> str:
 
 
 _XML_SPACE = "{%s}space" % NS_XML
+
+_REL_BASE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+# Parts that hold their own paragraphs, reached by relationship from the
+# document part: (relationship type, wrapper element, location type, label).
+_NOTE_PARTS = (
+    (f"{_REL_BASE}/footnotes", "footnote", 'footnote', 'Footnote'),
+    (f"{_REL_BASE}/endnotes", "endnote", 'endnote', 'Endnote'),
+    (f"{_REL_BASE}/comments", "comment", 'comment', 'Comment'),
+)
+
+# Separator "footnotes" are Word's rule lines, not content.
+_NOTE_SKIP_TYPES = frozenset({'separator', 'continuationSeparator'})
 
 _T = _w('t')
 _P = _w('p')
@@ -109,6 +136,8 @@ class Match:
     context_after: str          # ~50 chars after match
     is_selected: bool = True    # User's checkbox state
     applied: Optional[bool] = None   # Set by apply_changes(): True, False, or None
+    file_mtime: float = 0.0     # File mtime when scanned, for the staleness check
+    file_size: int = 0          # File size when scanned, for the staleness check
 
     @property
     def display_context(self) -> str:
@@ -284,6 +313,8 @@ def _collect_paragraphs(doc) -> List[Tuple[object, str, str, str]]:
         for ordinal, (p_el, l_type, detail) in enumerate(raw):
             collected.append((p_el, l_type, detail, f"{part_name}#{ordinal}"))
 
+    seen_parts = set()
+
     # --- Body (includes tables, nested tables and text boxes)
     add_part(str(doc.part.partname), doc.element.body, 'body', "")
 
@@ -297,7 +328,6 @@ def _collect_paragraphs(doc) -> List[Tuple[object, str, str, str]]:
         (_w('footerReference'), 'footer', 'Footer'),
     )
     type_labels = {'default': '', 'first': 'First Page ', 'even': 'Even Page '}
-    seen_parts = set()
 
     for section in doc.sections:
         try:
@@ -324,6 +354,32 @@ def _collect_paragraphs(doc) -> List[Tuple[object, str, str, str]]:
                 except Exception:
                     continue
                 add_part(part_name, root_el, loc_type, label)
+
+    # --- Footnotes, endnotes and comments, each a part of its own.
+    for reltype, wrapper, loc_type, base_label in _NOTE_PARTS:
+        for rel in list(doc.part.rels.values()):
+            if rel.reltype != reltype or rel.is_external:
+                continue
+            part = rel.target_part
+            root_el = getattr(part, 'element', None)
+            if root_el is None:
+                continue
+            part_name = str(part.partname)
+            if part_name in seen_parts:
+                continue
+            seen_parts.add(part_name)
+
+            raw: List[tuple] = []
+            for note in root_el:
+                if note.tag != _w(wrapper):
+                    continue
+                if note.get(_w('type')) in _NOTE_SKIP_TYPES:
+                    continue
+                note_id = note.get(_w('id'))
+                label = f"{base_label} {note_id}" if note_id else base_label
+                _walk_container(note, loc_type, label, raw)
+            for ordinal, (p_el, l_type, detail) in enumerate(raw):
+                collected.append((p_el, l_type, detail, f"{part_name}#{ordinal}"))
 
     return collected
 
@@ -377,21 +433,29 @@ def scan_documents(folder_path: str, find_text: str, case_sensitive: bool = True
     Scan all .docx files in a folder for occurrences of find_text.
 
     Returns one FileResult per file that either matched or failed to open.
-    Use `scan_summary` for the number of files actually examined.
+    Use `scan_documents_detailed` when the caller also needs the file count.
     """
     return scan_documents_detailed(folder_path, find_text, case_sensitive)[0]
 
 
 def scan_documents_detailed(folder_path: str, find_text: str,
-                            case_sensitive: bool = True) -> Tuple[List[FileResult], dict]:
+                            case_sensitive: bool = True,
+                            progress_callback=None,
+                            cancel_event=None) -> Tuple[List[FileResult], dict]:
     """
     Scan a folder and also report how many .docx files were examined.
 
-    Returns ``(results, summary)`` where summary has keys 'files_scanned' and
-    'files_with_matches'. The caller needs 'files_scanned' to tell "no .docx
-    files in this folder" apart from "no matches in any of them".
+    Args:
+        progress_callback: Optional callable(file_name, file_index, total_files),
+            called before each file so a GUI can show progress over a large set.
+        cancel_event: Optional object with `is_set()`. Checked between files;
+            when set the scan stops and the summary reports 'cancelled'.
+
+    Returns ``(results, summary)`` where summary has keys 'files_scanned',
+    'files_with_matches' and 'cancelled'. The caller needs 'files_scanned' to
+    tell "no .docx files in this folder" apart from "no matches in any of them".
     """
-    summary = {'files_scanned': 0, 'files_with_matches': 0}
+    summary = {'files_scanned': 0, 'files_with_matches': 0, 'cancelled': False}
 
     if not find_text:
         return [], summary
@@ -409,17 +473,32 @@ def scan_documents_detailed(folder_path: str, find_text: str,
         return [FileResult(file_path=folder_path, file_name=os.path.basename(folder_path),
                            error=f"Could not read folder: {e}")], summary
 
-    summary['files_scanned'] = len(docx_files)
     if not docx_files:
         return [], summary
 
     results = []
 
-    for file_path in docx_files:
+    for file_idx, file_path in enumerate(docx_files):
+        if cancel_event is not None and cancel_event.is_set():
+            summary['cancelled'] = True
+            break
+
+        if progress_callback:
+            progress_callback(os.path.basename(file_path), file_idx, len(docx_files))
+
+        summary['files_scanned'] += 1
         file_result = FileResult(
             file_path=file_path,
             file_name=os.path.basename(file_path)
         )
+
+        # Recorded so apply_changes can tell whether the file changed underneath
+        # the preview. A stale offset must never be applied blind.
+        try:
+            stat = os.stat(file_path)
+            file_mtime, file_size = stat.st_mtime, stat.st_size
+        except OSError:
+            file_mtime, file_size = 0.0, 0
 
         try:
             doc = Document(file_path)
@@ -461,6 +540,8 @@ def scan_documents_detailed(folder_path: str, find_text: str,
                     context_before=context_before,
                     match_text=full_text[char_offset:char_offset + len(find_text)],
                     context_after=context_after,
+                    file_mtime=file_mtime,
+                    file_size=file_size,
                 ))
 
         if file_result.matches:
@@ -569,6 +650,34 @@ def _make_backup_path(file_path: str) -> str:
     return candidate
 
 
+def _describe_staleness(file_path: str, reference: Match) -> Optional[str]:
+    """
+    Return a reason string if the file changed since it was scanned, else None.
+
+    The preview records character offsets into a specific version of a file. If
+    the document is edited in Word between Preview and Apply, those offsets can
+    still validate against different text and quietly damage the document, so
+    the file is refused rather than guessed at.
+
+    A match with no recorded stat (constructed by hand, or a file that could not
+    be stat-ed at scan time) is not checked.
+    """
+    if not reference.file_mtime and not reference.file_size:
+        return None
+
+    try:
+        stat = os.stat(file_path)
+    except OSError as e:
+        return f"could not be read ({e})."
+
+    if stat.st_size != reference.file_size:
+        return ("changed on disk since the preview "
+                f"(size {reference.file_size} -> {stat.st_size}).")
+    if abs(stat.st_mtime - reference.file_mtime) > 0.001:
+        return "was modified on disk since the preview."
+    return None
+
+
 def _save_atomically(doc, file_path: str) -> None:
     """
     Save to a temporary file in the same directory, then replace the original.
@@ -641,6 +750,14 @@ def apply_changes(matches: List[Match], replace_text: str,
         # failed save - still reports its matches as skipped. A selected change
         # must never disappear from the totals.
         try:
+            stale = _describe_staleness(file_path, file_matches[0])
+            if stale:
+                errors.append(f"{file_name}: {stale} Nothing was changed in this "
+                              f"file - re-run Preview Changes.")
+                for m in file_matches:
+                    m.applied = False
+                continue
+
             try:
                 doc = Document(file_path)
             except Exception as e:
