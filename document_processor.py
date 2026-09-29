@@ -268,7 +268,137 @@ def _has_intervening(el, ancestor_tags, stop_el) -> bool:
     return False
 
 
-def _walk_textboxes(p_el, loc_type: str, para_detail: str, out: List[tuple]) -> None:
+# --------------------------------------------------------------------------
+# Section context: the nearest preceding headings of a body paragraph
+# --------------------------------------------------------------------------
+
+_HEADING_LABEL_MAX = 60
+
+
+def _styles_root(doc):
+    """
+    The ``w:styles`` element, or None if the document has no styles part.
+
+    Resolved through the document part's relationships, never through
+    `doc.styles`: that property *creates* a default styles part when one is
+    missing, and a scan must not change what gets saved.
+    """
+    for rel in doc.part.rels.values():
+        if rel.reltype == f"{_REL_BASE}/styles" and not rel.is_external:
+            return getattr(rel.target_part, 'element', None)
+    return None
+
+
+def _outline_levels_by_style(styles_root) -> Dict[str, Optional[int]]:
+    """
+    Map every paragraph style id to its outline level (0-8), or None.
+
+    A style's own ``w:outlineLvl`` wins; level 9 means "body text" and stops
+    inheritance - Word's own TOC Heading style is based on Heading 1 with an
+    explicit level 9. Otherwise the ``w:basedOn`` chain is followed. A style
+    with no level anywhere but named "heading N" is treated as level N-1, for
+    templates whose heading styles were stripped of outline levels.
+    """
+    info: Dict[str, Tuple[str, Optional[str], Optional[int]]] = {}
+    if styles_root is None:
+        return {}
+    for style in styles_root.findall(_w('style')):
+        if style.get(_w('type')) != 'paragraph':
+            continue
+        style_id = style.get(_w('styleId'))
+        if not style_id:
+            continue
+        name_el = style.find(_w('name'))
+        name = (name_el.get(_w('val')) if name_el is not None else "") or ""
+        based_el = style.find(_w('basedOn'))
+        based_on = based_el.get(_w('val')) if based_el is not None else None
+        own = None
+        lvl = style.find(f"{_w('pPr')}/{_w('outlineLvl')}")
+        if lvl is not None:
+            try:
+                own = int(lvl.get(_w('val')))
+            except (TypeError, ValueError):
+                own = None
+        info[style_id] = (name, based_on, own)
+
+    resolved: Dict[str, Optional[int]] = {}
+
+    def resolve(style_id: str, seen: set) -> Optional[int]:
+        if style_id in resolved:
+            return resolved[style_id]
+        if style_id not in info or style_id in seen:
+            return None
+        seen.add(style_id)
+        name, based_on, own = info[style_id]
+        if own is not None:
+            level = own if 0 <= own <= 8 else None
+        else:
+            level = resolve(based_on, seen) if based_on else None
+            if level is None:
+                m = re.fullmatch(r'heading ([1-9])', name.strip(), re.IGNORECASE)
+                if m:
+                    level = int(m.group(1)) - 1
+        resolved[style_id] = level
+        return level
+
+    for style_id in info:
+        resolve(style_id, set())
+    return resolved
+
+
+def _outline_level(p_el, levels: Dict[str, Optional[int]]) -> Optional[int]:
+    """A paragraph's outline level: its own ``w:outlineLvl``, else its style's."""
+    ppr = p_el.find(_w('pPr'))
+    if ppr is None:
+        return None
+    lvl = ppr.find(_w('outlineLvl'))
+    if lvl is not None:
+        try:
+            n = int(lvl.get(_w('val')))
+        except (TypeError, ValueError):
+            n = None
+        if n is not None:
+            return n if 0 <= n <= 8 else None
+    pstyle = ppr.find(_w('pStyle'))
+    if pstyle is not None:
+        return levels.get(pstyle.get(_w('val')))
+    return None
+
+
+class _HeadingTracker:
+    """
+    Follows headings through a body walk so each paragraph can record the
+    headings above it, e.g. ``GENERAL > REFERENCES``.
+
+    Only flow-level body paragraphs are observed; paragraphs in table cells
+    and text boxes inherit the current path without changing it. Numbering
+    that Word generates ("PART 1", "1.02") is not part of the paragraph text
+    and so does not appear in the label.
+    """
+
+    def __init__(self, levels: Dict[str, Optional[int]]):
+        self.levels = levels
+        self.stack: List[Tuple[int, str]] = []
+
+    def observe(self, p_el) -> None:
+        level = _outline_level(p_el, self.levels)
+        if level is None:
+            return
+        label = " ".join(paragraph_text(p_el).split())
+        if not label:
+            return
+        if len(label) > _HEADING_LABEL_MAX:
+            label = label[:_HEADING_LABEL_MAX - 1].rstrip() + "…"
+        self.stack = [(lvl, text) for lvl, text in self.stack if lvl < level]
+        self.stack.append((level, label))
+
+    @property
+    def path(self) -> str:
+        return " > ".join(text for _lvl, text in self.stack)
+
+
+def _walk_textboxes(p_el, loc_type: str, para_detail: str, out: List[tuple],
+                    headings: Optional[_HeadingTracker] = None) -> None:
     """Collect paragraphs of any text box anchored in this paragraph."""
     for txbx in p_el.iter(_TXBX_CONTENT):
         # Skip the legacy mc:Fallback copy of a text box; Word renders mc:Choice.
@@ -277,10 +407,11 @@ def _walk_textboxes(p_el, loc_type: str, para_detail: str, out: List[tuple]) -> 
         # A nested text box is reached through its own paragraph's walk.
         if _has_intervening(txbx, {_TXBX_CONTENT}, p_el):
             continue
-        _walk_container(txbx, loc_type, f"{para_detail}, Text Box", out)
+        _walk_container(txbx, loc_type, f"{para_detail}, Text Box", out, headings)
 
 
-def _walk_table(tbl_el, loc_type: str, prefix: str, table_no: int, out: List[tuple]) -> None:
+def _walk_table(tbl_el, loc_type: str, prefix: str, table_no: int, out: List[tuple],
+                headings: Optional[_HeadingTracker] = None) -> None:
     """Walk a ``w:tbl``. Iterating XML visits each physical cell exactly once."""
     base = f"{prefix}, " if prefix else ""
     cell_type = 'table' if loc_type == 'body' else loc_type
@@ -295,14 +426,18 @@ def _walk_table(tbl_el, loc_type: str, prefix: str, table_no: int, out: List[tup
                 continue
             cell_no += 1
             cell_prefix = f"{base}Table {table_no}, Row {row_no}, Cell {cell_no}"
-            _walk_container(cell, cell_type, cell_prefix, out)
+            _walk_container(cell, cell_type, cell_prefix, out, headings)
 
 
-def _walk_container(el, loc_type: str, prefix: str, out: List[tuple]) -> None:
+def _walk_container(el, loc_type: str, prefix: str, out: List[tuple],
+                    headings: Optional[_HeadingTracker] = None) -> None:
     """
     Walk a block-level container (``w:body``, ``w:hdr``, ``w:ftr``, ``w:tc``,
     ``w:txbxContent``) in document order, appending
-    ``(p_element, location_type, location_detail)`` tuples to `out`.
+    ``(p_element, location_type, location_detail, section)`` tuples to `out`.
+
+    `headings` tracks the heading path for the body part; flow-level body
+    paragraphs (an empty prefix) update it, everything else only reads it.
     """
     multi_para = sum(1 for c in el if c.tag == _P) > 1
     para_no = 0
@@ -318,43 +453,61 @@ def _walk_container(el, loc_type: str, prefix: str, out: List[tuple]) -> None:
                 detail = f"{prefix}, Para {para_no}"
             else:
                 detail = prefix
-            out.append((child, loc_type, detail))
-            _walk_textboxes(child, loc_type, detail, out)
+            if headings is not None and loc_type == 'body' and not prefix:
+                headings.observe(child)
+            section = headings.path if headings is not None else ""
+            out.append((child, loc_type, detail, section))
+            _walk_textboxes(child, loc_type, detail, out, headings)
         elif tag == _TBL:
             table_no += 1
-            _walk_table(child, loc_type, prefix, table_no, out)
+            _walk_table(child, loc_type, prefix, table_no, out, headings)
         elif tag == _SDT:
             content = child.find(_SDT_CONTENT)
             if content is not None:
-                _walk_container(content, loc_type, prefix, out)
+                _walk_container(content, loc_type, prefix, out, headings)
         elif tag == _ALT_CONTENT:
             choice = child.find(_CHOICE)
             if choice is not None:
-                _walk_container(choice, loc_type, prefix, out)
+                _walk_container(choice, loc_type, prefix, out, headings)
 
 
-def _collect_paragraphs(doc) -> List[Tuple[object, str, str, str]]:
+class _Located(NamedTuple):
+    """One paragraph found by the traversal."""
+    element: object
+    loc_type: str
+    detail: str
+    key: str
+    section: str
+
+
+def _locate_paragraphs(doc) -> List[_Located]:
     """
     Collect every paragraph in the document exactly once.
 
-    Returns ``(p_element, location_type, location_detail, paragraph_key)``.
-
-    `paragraph_key` is ``"<part name>#<ordinal>"``. The ordinal is the position
-    in this deterministic XML walk of that part, so the same physical paragraph
-    receives the same key on every load of an unchanged file.
+    `key` is ``"<part name>#<ordinal>"``. The ordinal is the position in this
+    deterministic XML walk of that part, so the same physical paragraph
+    receives the same key on every load of an unchanged file. `section` is
+    the heading path above a body paragraph, "" elsewhere.
     """
-    collected: List[Tuple[object, str, str, str]] = []
+    collected: List[_Located] = []
 
-    def add_part(part_name: str, root_el, loc_type: str, label: str) -> None:
+    def add_part(part_name: str, root_el, loc_type: str, label: str,
+                 headings: Optional[_HeadingTracker] = None) -> None:
         raw: List[tuple] = []
-        _walk_container(root_el, loc_type, label, raw)
-        for ordinal, (p_el, l_type, detail) in enumerate(raw):
-            collected.append((p_el, l_type, detail, f"{part_name}#{ordinal}"))
+        _walk_container(root_el, loc_type, label, raw, headings)
+        for ordinal, (p_el, l_type, detail, section) in enumerate(raw):
+            collected.append(_Located(p_el, l_type, detail,
+                                      f"{part_name}#{ordinal}", section))
 
     seen_parts = set()
 
     # --- Body (includes tables, nested tables and text boxes)
-    add_part(str(doc.part.partname), doc.element.body, 'body', "")
+    try:
+        levels = _outline_levels_by_style(_styles_root(doc))
+    except Exception:
+        levels = {}
+    add_part(str(doc.part.partname), doc.element.body, 'body', "",
+             _HeadingTracker(levels))
 
     # --- Headers and footers.
     # Resolved through w:headerReference / w:footerReference rather than
@@ -416,10 +569,22 @@ def _collect_paragraphs(doc) -> List[Tuple[object, str, str, str]]:
                 note_id = note.get(_w('id'))
                 label = f"{base_label} {note_id}" if note_id else base_label
                 _walk_container(note, loc_type, label, raw)
-            for ordinal, (p_el, l_type, detail) in enumerate(raw):
-                collected.append((p_el, l_type, detail, f"{part_name}#{ordinal}"))
+            for ordinal, (p_el, l_type, detail, _section) in enumerate(raw):
+                collected.append(_Located(p_el, l_type, detail,
+                                          f"{part_name}#{ordinal}", ""))
 
     return collected
+
+
+def _collect_paragraphs(doc) -> List[Tuple[object, str, str, str]]:
+    """
+    Every paragraph as ``(p_element, location_type, location_detail, key)``.
+
+    The four-field view of `_locate_paragraphs`, kept for callers that do not
+    need the section path.
+    """
+    return [(loc.element, loc.loc_type, loc.detail, loc.key)
+            for loc in _locate_paragraphs(doc)]
 
 
 # --------------------------------------------------------------------------
@@ -675,13 +840,13 @@ def scan_documents_detailed(folder_path: str, rules: Union[str, Sequence[Rule]],
             continue
 
         try:
-            all_paragraphs = _collect_paragraphs(doc)
+            all_paragraphs = _locate_paragraphs(doc)
         except Exception as e:
             file_result.error = f"Error reading document structure: {str(e)}"
             results.append(file_result)
             continue
 
-        for p_el, loc_type, loc_detail, para_key in all_paragraphs:
+        for p_el, loc_type, loc_detail, para_key, section in all_paragraphs:
             full_text, _nodes = _paragraph_text_and_nodes(p_el)
             if not full_text:
                 continue
@@ -707,6 +872,7 @@ def scan_documents_detailed(folder_path: str, rules: Union[str, Sequence[Rule]],
                         file_size=file_size,
                         find_text=find_text,
                         replace_text=rule.replace_text,
+                        section=section,
                     ))
 
             # Document order, whichever rule found them; then flag overlaps.

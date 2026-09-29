@@ -111,6 +111,48 @@ def add_tab_run(paragraph):
     paragraph._p.append(parse_xml('<w:r xmlns:w="%s"><w:tab/></w:r>' % NS_W))
 
 
+def add_paragraph_with_outline_level(doc, text, level):
+    """A Normal-styled paragraph carrying its own w:outlineLvl."""
+    p = doc.add_paragraph(text)
+    ppr = p._p.get_or_add_pPr()
+    ppr.append(parse_xml('<w:outlineLvl xmlns:w="%s" w:val="%d"/>' % (NS_W, level)))
+    return p
+
+
+def add_custom_paragraph_style(doc, style_id, name, based_on=None, outline_level=None):
+    """Append a paragraph style to the styles part. Test code may use
+    doc.styles; only the scan path must not."""
+    parts = ['<w:style xmlns:w="%s" w:type="paragraph" w:styleId="%s">' % (NS_W, style_id),
+             '<w:name w:val="%s"/>' % _escape(name)]
+    if based_on:
+        parts.append('<w:basedOn w:val="%s"/>' % based_on)
+    if outline_level is not None:
+        parts.append('<w:pPr><w:outlineLvl w:val="%d"/></w:pPr>' % outline_level)
+    parts.append('</w:style>')
+    doc.styles.element.append(parse_xml("".join(parts)))
+
+
+def add_styled_paragraph(doc, text, style_id):
+    """A paragraph whose w:pStyle names `style_id` directly (no style lookup)."""
+    p = doc.add_paragraph(text)
+    ppr = p._p.get_or_add_pPr()
+    ppr.insert(0, parse_xml('<w:pStyle xmlns:w="%s" w:val="%s"/>' % (NS_W, style_id)))
+    return p
+
+
+def drop_styles_part(doc):
+    """Detach the styles part so the saved package has none."""
+    for r_id, rel in list(doc.part.rels.items()):
+        if rel.reltype.endswith("/styles"):
+            doc.part.drop_rel(r_id)
+
+
+def has_styles_part(path):
+    from zipfile import ZipFile
+    with ZipFile(path) as z:
+        return "word/styles.xml" in z.namelist()
+
+
 def add_complex_field(paragraph, instruction, cached_result):
     """
     Append a complex field: fldChar begin / instrText / separate / cached
@@ -477,3 +519,20 @@ def nested_folder_docs(docdir):
         paths.append(str(path))
     (docdir / "sub" / "~$lock.docx").write_bytes(b"lock")
     return paths
+
+
+@pytest.fixture
+def heading_doc(docdir):
+    """Heading 1 / body / Heading 2 / body / table / Heading 1 / body."""
+    doc = Document()
+    doc.add_heading("GENERAL", level=1)
+    doc.add_paragraph("Intro cites 2022 CBC.")
+    doc.add_heading("REFERENCES", level=2)
+    doc.add_paragraph("Body cites 2022 CBC.")
+    table = doc.add_table(rows=1, cols=1)
+    table.cell(0, 0).text = "Cell cites 2022 CBC."
+    doc.add_heading("PRODUCTS", level=1)
+    doc.add_paragraph("Later cites 2022 CBC.")
+    path = docdir / "headings.docx"
+    doc.save(str(path))
+    return str(path)
