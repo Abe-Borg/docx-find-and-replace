@@ -77,7 +77,8 @@ def test_nothing_selected_changes_nothing(repeated_doc):
     before = all_text(repeated_doc)
     result = dp.apply_changes(matches, "2025", create_backups=True)
     assert result == {'total_replaced': 0, 'total_skipped': 0, 'files_modified': 0,
-                      'backups': [], 'errors': []}
+                      'backups': [], 'backup_map': {}, 'skip_reasons': {},
+                      'errors': []}
     assert all_text(repeated_doc) == before
 
 

@@ -84,3 +84,6 @@ Desktop.ini
 # Database
 *.db
 *.sqlite3
+
+# Floor-version test venv (see CLAUDE.md)
+.venv-floor/

@@ -79,6 +79,80 @@ def add_deletion(paragraph, text, author="Reviewer"):
     paragraph._p.append(parse_xml(xml))
 
 
+def add_formatted_run(paragraph, text, bold=False, color=None):
+    """Append a run carrying explicit formatting (w:rPr with w:b / w:color)."""
+    props = ""
+    if bold:
+        props += "<w:b/>"
+    if color:
+        props += '<w:color w:val="%s"/>' % color
+    xml = (
+        '<w:r xmlns:w="%s"><w:rPr>%s</w:rPr>'
+        '<w:t xml:space="preserve">%s</w:t></w:r>'
+        % (NS_W, props, _escape(text))
+    )
+    paragraph._p.append(parse_xml(xml))
+
+
+def add_run_with_rpr_change(paragraph, text, change_id=902):
+    """Append a bold run whose formatting is itself a tracked change."""
+    xml = (
+        '<w:r xmlns:w="%s"><w:rPr><w:b/>'
+        '<w:rPrChange w:id="%d" w:author="Reviewer" w:date="2026-01-01T00:00:00Z">'
+        '<w:rPr/></w:rPrChange></w:rPr>'
+        '<w:t xml:space="preserve">%s</w:t></w:r>'
+        % (NS_W, change_id, _escape(text))
+    )
+    paragraph._p.append(parse_xml(xml))
+
+
+def add_tab_run(paragraph):
+    """Append a run holding only a <w:tab/>."""
+    paragraph._p.append(parse_xml('<w:r xmlns:w="%s"><w:tab/></w:r>' % NS_W))
+
+
+def add_paragraph_with_outline_level(doc, text, level):
+    """A Normal-styled paragraph carrying its own w:outlineLvl."""
+    p = doc.add_paragraph(text)
+    ppr = p._p.get_or_add_pPr()
+    ppr.append(parse_xml('<w:outlineLvl xmlns:w="%s" w:val="%d"/>' % (NS_W, level)))
+    return p
+
+
+def add_custom_paragraph_style(doc, style_id, name, based_on=None, outline_level=None):
+    """Append a paragraph style to the styles part. Test code may use
+    doc.styles; only the scan path must not."""
+    parts = ['<w:style xmlns:w="%s" w:type="paragraph" w:styleId="%s">' % (NS_W, style_id),
+             '<w:name w:val="%s"/>' % _escape(name)]
+    if based_on:
+        parts.append('<w:basedOn w:val="%s"/>' % based_on)
+    if outline_level is not None:
+        parts.append('<w:pPr><w:outlineLvl w:val="%d"/></w:pPr>' % outline_level)
+    parts.append('</w:style>')
+    doc.styles.element.append(parse_xml("".join(parts)))
+
+
+def add_styled_paragraph(doc, text, style_id):
+    """A paragraph whose w:pStyle names `style_id` directly (no style lookup)."""
+    p = doc.add_paragraph(text)
+    ppr = p._p.get_or_add_pPr()
+    ppr.insert(0, parse_xml('<w:pStyle xmlns:w="%s" w:val="%s"/>' % (NS_W, style_id)))
+    return p
+
+
+def drop_styles_part(doc):
+    """Detach the styles part so the saved package has none."""
+    for r_id, rel in list(doc.part.rels.items()):
+        if rel.reltype.endswith("/styles"):
+            doc.part.drop_rel(r_id)
+
+
+def has_styles_part(path):
+    from zipfile import ZipFile
+    with ZipFile(path) as z:
+        return "word/styles.xml" in z.namelist()
+
+
 def add_complex_field(paragraph, instruction, cached_result):
     """
     Append a complex field: fldChar begin / instrText / separate / cached
@@ -200,6 +274,64 @@ def all_text(path):
     import document_processor as dp
     doc = Document(path)
     return [dp.paragraph_text(p) for p, _t, _d, _k in dp._collect_paragraphs(doc)]
+
+
+def revisions(path):
+    """Every w:ins / w:del in the body, in document order, as
+    (local tag, id, author, text)."""
+    doc = Document(path)
+    out = []
+    for el in doc.element.body.iter(qn("w:ins"), qn("w:del")):
+        texts = [t.text or "" for t in el.iter(qn("w:t"), qn("w:delText"))]
+        out.append((el.tag.split("}")[1], el.get(qn("w:id")),
+                    el.get(qn("w:author")), "".join(texts)))
+    return out
+
+
+def all_revision_ids(path):
+    """Every w:ins / w:del id across every XML part of the package."""
+    doc = Document(path)
+    ids = []
+    for part in doc.part.package.iter_parts():
+        root = getattr(part, "element", None)
+        if root is None:
+            continue
+        for el in root.iter(qn("w:ins"), qn("w:del"), qn("w:rPrChange")):
+            ids.append(el.get(qn("w:id")))
+    return ids
+
+
+def _resolved_texts(path, keep):
+    """Paragraph texts after simulating Word's Accept All (keep='ins') or
+    Reject All (keep='del') on the whole package."""
+    import document_processor as dp
+    doc = Document(path)
+    drop, unwrap = (qn("w:del"), qn("w:ins")) if keep == "ins" else (qn("w:ins"), qn("w:del"))
+    for part in doc.part.package.iter_parts():
+        root = getattr(part, "element", None)
+        if root is None:
+            continue
+        for el in list(root.iter(drop)):
+            el.getparent().remove(el)
+        for el in list(root.iter(unwrap)):
+            parent = el.getparent()
+            for child in list(el):
+                if keep == "del":
+                    for dt in child.iter(qn("w:delText")):
+                        t = parse_xml('<w:t xmlns:w="%s" xml:space="preserve"/>' % NS_W)
+                        t.text = dt.text
+                        dt.getparent().replace(dt, t)
+                el.addprevious(child)
+            parent.remove(el)
+    return [dp.paragraph_text(p) for p, _t, _d, _k in dp._collect_paragraphs(doc)]
+
+
+def accept_all(path):
+    return _resolved_texts(path, "ins")
+
+
+def reject_all(path):
+    return _resolved_texts(path, "del")
 
 
 # ---------------------------------------------------------------- fixtures
@@ -356,5 +488,51 @@ def repeated_doc(docdir):
     doc = Document()
     doc.add_paragraph("aaaa and 2022 2022 2022")
     path = docdir / "repeated.docx"
+    doc.save(str(path))
+    return str(path)
+
+
+@pytest.fixture
+def formatted_split_doc(docdir):
+    """'20' bold, '22 CBC' bold+red, ' ref' plain - a phrase spanning formats."""
+    doc = Document()
+    p = doc.add_paragraph()
+    add_formatted_run(p, "20", bold=True)
+    add_formatted_run(p, "22 CBC", bold=True, color="FF0000")
+    add_run(p, " ref")
+    path = docdir / "formatted.docx"
+    doc.save(str(path))
+    return str(path)
+
+
+@pytest.fixture
+def nested_folder_docs(docdir):
+    """a.docx at the top, sub/b.docx, sub/deeper/c.docx, plus a Word lock file."""
+    (docdir / "sub" / "deeper").mkdir(parents=True)
+    paths = []
+    for rel in ("a.docx", os.path.join("sub", "b.docx"),
+                os.path.join("sub", "deeper", "c.docx")):
+        doc = Document()
+        doc.add_paragraph("Nested cites 2022 CBC.")
+        path = docdir / rel
+        doc.save(str(path))
+        paths.append(str(path))
+    (docdir / "sub" / "~$lock.docx").write_bytes(b"lock")
+    return paths
+
+
+@pytest.fixture
+def heading_doc(docdir):
+    """Heading 1 / body / Heading 2 / body / table / Heading 1 / body."""
+    doc = Document()
+    doc.add_heading("GENERAL", level=1)
+    doc.add_paragraph("Intro cites 2022 CBC.")
+    doc.add_heading("REFERENCES", level=2)
+    doc.add_paragraph("Body cites 2022 CBC.")
+    table = doc.add_table(rows=1, cols=1)
+    table.cell(0, 0).text = "Cell cites 2022 CBC."
+    doc.add_heading("PRODUCTS", level=1)
+    doc.add_paragraph("Later cites 2022 CBC.")
+    path = docdir / "headings.docx"
     doc.save(str(path))
     return str(path)
