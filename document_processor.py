@@ -696,9 +696,9 @@ def _is_docx_name(name: str) -> bool:
     return name.lower().endswith('.docx') and not name.startswith('~$')
 
 
-def _list_docx(folder_path: str, recursive: bool = False) -> List[str]:
+def _list_files(folder_path: str, recursive: bool, wanted) -> List[str]:
     """
-    Every .docx under the folder, sorted, skipping Word's ``~$`` lock files.
+    Files under the folder whose name satisfies `wanted`, sorted.
 
     Raises the underlying OSError for the top folder. With ``recursive``,
     subfolders are walked in sorted order without following symlinks; a
@@ -707,7 +707,7 @@ def _list_docx(folder_path: str, recursive: bool = False) -> List[str]:
     if not recursive:
         return sorted(
             os.path.join(folder_path, f)
-            for f in os.listdir(folder_path) if _is_docx_name(f)
+            for f in os.listdir(folder_path) if wanted(f)
         )
 
     # Probe the top folder so a permission error there surfaces as it does in
@@ -718,9 +718,14 @@ def _list_docx(folder_path: str, recursive: bool = False) -> List[str]:
     for root, dirs, files in os.walk(folder_path, followlinks=False):
         dirs.sort()
         for f in sorted(files):
-            if _is_docx_name(f):
+            if wanted(f):
                 found.append(os.path.join(root, f))
     return found
+
+
+def _list_docx(folder_path: str, recursive: bool = False) -> List[str]:
+    """Every .docx under the folder, sorted, skipping Word's ``~$`` lock files."""
+    return _list_files(folder_path, recursive, _is_docx_name)
 
 
 def _mark_conflicts(matches: List[Match]) -> None:
@@ -1477,4 +1482,132 @@ def apply_changes(matches: List[Match], replace_text: Optional[str] = None,
     if progress_callback:
         progress_callback("Done", total_files - 1 if total_files else 0, total_files)
 
+    return result
+
+
+# --------------------------------------------------------------------------
+# Change log
+# --------------------------------------------------------------------------
+
+CHANGE_LOG_COLUMNS = ("file", "location", "section", "find", "replace",
+                      "before", "match", "after", "status", "backup")
+
+
+def _match_status(match: Match) -> str:
+    if not match.is_selected:
+        return "not selected"
+    if match.applied:
+        return "applied"
+    return f"skipped: {match.skip_reason or 'not applied'}"
+
+
+def write_change_log(path: str, matches: Sequence[Match],
+                     backup_map: Optional[Dict[str, str]] = None) -> str:
+    """
+    Write a CSV record of a run: one row per match, applied or not.
+
+    Written as UTF-8 with a byte-order mark so Excel opens it correctly, with
+    the columns in `CHANGE_LOG_COLUMNS`. The status column reads ``applied``,
+    ``skipped: <reason>`` or ``not selected``. Returns `path`.
+    """
+    backup_map = backup_map or {}
+    with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(CHANGE_LOG_COLUMNS)
+        for m in matches:
+            writer.writerow([
+                m.file_path,
+                f"{m.location_type}: {m.location_detail}",
+                m.section,
+                m.effective_find_text,
+                m.replace_text,
+                m.context_before,
+                m.match_text,
+                m.context_after,
+                _match_status(m),
+                backup_map.get(m.file_path, ""),
+            ])
+    return path
+
+
+# --------------------------------------------------------------------------
+# Backups: discovery and restore
+# --------------------------------------------------------------------------
+
+_BACKUP_RE = re.compile(
+    r'^(?P<doc>.+\.docx)\.(?P<stamp>\d{8}-\d{6})(?:-(?P<n>\d+))?\.bak$',
+    re.IGNORECASE,
+)
+
+
+class Backup(NamedTuple):
+    """A timestamped backup written by `apply_changes` and the document it is of."""
+    document_path: str
+    backup_path: str
+    timestamp: datetime
+    sequence: int          # the -N collision suffix, 0 when absent
+
+
+def _parse_backup(path: str) -> Optional[Backup]:
+    m = _BACKUP_RE.match(os.path.basename(path))
+    if not m:
+        return None
+    try:
+        stamp = datetime.strptime(m.group('stamp'), "%Y%m%d-%H%M%S")
+    except ValueError:
+        return None
+    document = os.path.join(os.path.dirname(path), m.group('doc'))
+    return Backup(document, path, stamp, int(m.group('n') or 0))
+
+
+def find_backups(folder_path: str, recursive: bool = False) -> List[Backup]:
+    """
+    Every backup under the folder, grouped by document, newest first.
+
+    Only files matching the name pattern `_make_backup_path` writes are
+    returned; an unrelated ``.bak`` is ignored. Raises the folder's OSError.
+    """
+    names = _list_files(folder_path, recursive, lambda f: f.lower().endswith('.bak'))
+    backups = [b for b in (_parse_backup(p) for p in names) if b is not None]
+    backups.sort(key=lambda b: (b.document_path.lower(), b.document_path,
+                                -b.timestamp.timestamp(), -b.sequence))
+    return backups
+
+
+def restore_backups(backups: Sequence[Backup], progress_callback=None) -> dict:
+    """
+    Copy each backup back over its document.
+
+    The copy goes to a temporary file beside the document and is swapped in
+    with ``os.replace``, so an interrupted restore cannot leave a truncated
+    document. The backup file is left in place. Two backups of the same
+    document in one call is a ``ValueError`` raised before anything is
+    touched. Returns ``{'restored': n, 'restored_paths': [...], 'errors': [...]}``.
+    """
+    seen = set()
+    for b in backups:
+        key = os.path.normcase(os.path.abspath(b.document_path))
+        if key in seen:
+            raise ValueError(f"More than one backup selected for {b.document_path}")
+        seen.add(key)
+
+    result = {'restored': 0, 'restored_paths': [], 'errors': []}
+    for idx, b in enumerate(backups):
+        name = os.path.basename(b.document_path)
+        if progress_callback:
+            progress_callback(name, idx, len(backups))
+        directory = os.path.dirname(os.path.abspath(b.document_path))
+        tmp_path = os.path.join(directory, f".{name}.{os.getpid()}.tmp")
+        try:
+            shutil.copy2(b.backup_path, tmp_path)
+            os.replace(tmp_path, b.document_path)
+            result['restored'] += 1
+            result['restored_paths'].append(b.document_path)
+        except Exception as e:
+            result['errors'].append(f"Could not restore {name}: {e}")
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
     return result
