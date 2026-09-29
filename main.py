@@ -431,8 +431,23 @@ class FindReplaceApp:
         if invalidate and self.all_matches and not self.is_processing:
             self._invalidate_results()
 
+    def _selected_rule_index(self) -> Optional[int]:
+        """Index of the one rule selected in the list, if exactly one is."""
+        selected = self.rules_tree.selection()
+        if len(selected) == 1 and selected[0] in self.rule_iids:
+            return self.rule_iids.index(selected[0])
+        return None
+
     def _add_rule(self):
-        """Add the editor's rule to the set, or update the rule with that find text."""
+        """
+        Add the editor's rule to the set, or update an existing rule.
+
+        The rule selected in the list is the one being edited, so it is
+        replaced whichever field changed - editing its find text must not
+        leave the old rule behind to take part in the next preview. With no
+        selection, a rule with the same find text is updated in place and
+        anything else is appended.
+        """
         if self.is_processing:
             return
         rule = self._pending_rule()
@@ -440,21 +455,38 @@ class FindReplaceApp:
             messagebox.showwarning("Missing Input", "Please enter text to find.")
             return
         rules = list(self.rules)
-        for index, existing in enumerate(rules):
-            if existing.find_text == rule.find_text:
-                if existing == rule:
-                    self._clear_editor()
-                    return
-                rules[index] = rule
-                break
+        target = self._selected_rule_index()
+        if target is None:
+            for index, existing in enumerate(rules):
+                if existing.find_text == rule.find_text:
+                    target = index
+                    break
         else:
+            clash = next((i for i, existing in enumerate(rules)
+                          if i != target and existing.find_text == rule.find_text), None)
+            if clash is not None:
+                messagebox.showwarning(
+                    "Duplicate Rule",
+                    f'"{rule.find_text}" is already rule {clash + 1}. Remove one of '
+                    f'them or choose a different find text.')
+                return
+
+        if target is None:
             rules.append(rule)
+        elif rules[target] == rule:
+            self._clear_editor()
+            return
+        else:
+            rules[target] = rule
         self._set_rules(rules)
         self._clear_editor()
 
     def _clear_editor(self):
         self.find_var.set("")
         self.replace_var.set("")
+        selected = self.rules_tree.selection()
+        if selected:
+            self.rules_tree.selection_remove(*selected)
 
     def _remove_rules(self):
         """Remove the rules selected in the list."""

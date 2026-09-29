@@ -77,7 +77,7 @@ python main.py
 ```
 
 1. **Select folder** — Click "Browse..." and choose the folder containing your `.docx` files. Tick **Include subfolders** to scan the whole tree. Word's `~$*.docx` lock files are skipped either way.
-2. **Build the rule set** — Type a find text and its replacement and click **Add / Update**. Repeat for every rule. Selecting a rule in the list loads it back into the boxes so it can be changed; **Remove** drops the selected rules. **Load set...** and **Save set...** read and write the list as a CSV file (see [Rule-set files](#rule-set-files)). For a single replacement there is no need to click Add: Preview picks up whatever is still typed in the boxes.
+2. **Build the rule set** — Type a find text and its replacement and click **Add / Update**. Repeat for every rule. Selecting a rule in the list loads it back into the boxes so it can be changed, and **Add / Update** then replaces that rule whichever box was edited; **Remove** drops the selected rules. **Load set...** and **Save set...** read and write the list as a CSV file (see [Rule-set files](#rule-set-files)). For a single replacement there is no need to click Add: Preview picks up whatever is still typed in the boxes.
 3. **Configure options** — **Case sensitive** and **Whole word only** decide what counts as a match.
 4. **Preview** — Click "Preview Changes" to scan all documents. The status bar names each file as it is scanned, and the button becomes "Cancel Scan" so a large batch can be stopped early. Results appear in a tree view:
    - File-level nodes show total match count

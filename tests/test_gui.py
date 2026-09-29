@@ -524,6 +524,41 @@ def test_add_with_an_existing_find_updates_that_rule_in_place(app):
     assert app.rules == [dp.Rule("a", "changed"), dp.Rule("b", "2")]
 
 
+def test_editing_the_selected_rules_find_text_replaces_it(app):
+    """Codex review: changing a selected rule's find text appended a second
+    rule and left the old one active for the next preview."""
+    app._set_rules([dp.Rule("2022 CBC", "2025 CBC"), dp.Rule("x", "y")])
+    app.rules_tree.selection_set(app.rule_iids[0])
+    app._on_rule_selected()
+    app.find_var.set("2022 CFC")
+    app.replace_var.set("2025 CFC")
+    app._add_rule()
+    assert app.rules == [dp.Rule("2022 CFC", "2025 CFC"), dp.Rule("x", "y")]
+    assert app.rules_tree.selection() == ()
+    assert app.find_var.get() == ""
+
+
+def test_editing_a_selected_rule_into_a_duplicate_is_refused(app):
+    app._set_rules([dp.Rule("a", "1"), dp.Rule("b", "2")])
+    app.rules_tree.selection_set(app.rule_iids[0])
+    app._on_rule_selected()
+    app.find_var.set("b")
+    app._add_rule()
+    assert app.rules == [dp.Rule("a", "1"), dp.Rule("b", "2")]
+    assert "already rule 2" in tkstub.dialogs.warnings[-1][1]
+
+
+def test_unchanged_selected_rule_just_clears_the_editor(app):
+    app._set_rules([dp.Rule("a", "1")])
+    fr = dp.FileResult(file_path='a.docx', file_name='a.docx', matches=[make_match()])
+    app._display_results([fr], {'files_scanned': 1, 'cancelled': False})
+    app.rules_tree.selection_set(app.rule_iids[0])
+    app._on_rule_selected()
+    app._add_rule()
+    assert app.rules == [dp.Rule("a", "1")]
+    assert len(app.all_matches) == 1          # nothing changed, nothing invalidated
+
+
 def test_add_with_an_empty_find_warns(app):
     app.replace_var.set("only a replacement")
     app._add_rule()
