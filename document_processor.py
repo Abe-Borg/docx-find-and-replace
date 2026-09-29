@@ -36,16 +36,21 @@ changed in between, because a stale offset can still validate against different
 text.
 """
 
+import copy
+import csv
+import getpass
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 from docx import Document
 from docx.opc.constants import CONTENT_TYPE as _CT
 from docx.opc.exceptions import PackageNotFoundError
 from docx.opc.part import PartFactory, XmlPart
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 # Footnote, endnote and comment parts must load as XML so their paragraphs can
@@ -129,11 +134,19 @@ _INLINE_CONTAINERS = frozenset({
 })
 
 
+@dataclass(frozen=True)
+class Rule:
+    """One find/replace pair. A scan runs a list of these as a set."""
+    find_text: str
+    replace_text: str = ""
+
+
 @dataclass
 class Match:
     """Represents a single find-text occurrence in a document."""
     file_path: str
-    location_type: str          # 'body', 'table', 'header', 'footer'
+    location_type: str          # 'body', 'table', 'header', 'footer',
+                                # 'footnote', 'endnote' or 'comment'
     location_detail: str        # e.g., 'Paragraph 5', 'Table 2, Row 1, Cell 3'
     paragraph_key: str          # Structural key, stable across document loads
     char_offset: int            # Character offset within the paragraph's full text
@@ -144,6 +157,11 @@ class Match:
     applied: Optional[bool] = None   # Set by apply_changes(): True, False, or None
     file_mtime: float = 0.0     # File mtime when scanned, for the staleness check
     file_size: int = 0          # File size when scanned, for the staleness check
+    find_text: str = ""         # The rule's search text ("" -> use match_text)
+    replace_text: str = ""      # The rule's replacement text
+    section: str = ""           # Nearest heading path, e.g. "GENERAL > REFERENCES"
+    conflict: bool = False      # Overlaps a match from another rule; never applied
+    skip_reason: str = ""       # Why apply_changes() did not apply it, if it did not
 
     @property
     def display_context(self) -> str:
@@ -153,12 +171,17 @@ class Match:
         match = self.match_text.replace("\n", "⏎").replace("\t", " ")
         return f"{before}[{match}]{after}"
 
+    @property
+    def effective_find_text(self) -> str:
+        """The text this match was found with (hand-built matches carry none)."""
+        return self.find_text or self.match_text
+
 
 @dataclass
 class FileResult:
     """All matches for a single file."""
     file_path: str
-    file_name: str
+    file_name: str              # Relative to the scanned folder
     matches: List[Match] = field(default_factory=list)
     error: Optional[str] = None
 
@@ -169,6 +192,15 @@ class FileResult:
     @property
     def selected_count(self) -> int:
         return sum(1 for m in self.matches if m.is_selected)
+
+    @property
+    def conflict_count(self) -> int:
+        return sum(1 for m in self.matches if m.conflict)
+
+    @property
+    def selectable_count(self) -> int:
+        """Matches the user is allowed to select: everything but conflicts."""
+        return sum(1 for m in self.matches if not m.conflict)
 
 
 @dataclass
@@ -410,12 +442,36 @@ def _get_context(full_text: str, start: int, length: int, context_chars: int = 4
     return context_before, context_after
 
 
-def _find_all_occurrences(text: str, find_text: str, case_sensitive: bool = True) -> List[int]:
+def _is_word_char(ch: str) -> bool:
+    return ch.isalnum() or ch == '_'
+
+
+def _is_whole_word(text: str, start: int, end: int) -> bool:
+    """
+    True if ``text[start:end]`` is not glued to a neighbouring word character.
+
+    Only an edge of the match that is itself a word character needs a boundary:
+    "(2022)" is a whole word inside "x(2022)" because its parenthesis edges are
+    not word characters, while "2022" inside "20220" is not.
+    """
+    if end <= start:
+        return False
+    if _is_word_char(text[start]) and start > 0 and _is_word_char(text[start - 1]):
+        return False
+    if _is_word_char(text[end - 1]) and end < len(text) and _is_word_char(text[end]):
+        return False
+    return True
+
+
+def _find_all_occurrences(text: str, find_text: str, case_sensitive: bool = True,
+                          whole_word: bool = False) -> List[int]:
     """
     Find character offsets of every non-overlapping occurrence of find_text.
 
     Non-overlapping matches Word's own behaviour: "aa" occurs twice in "aaaa",
-    not three times.
+    not three times. With ``whole_word``, a candidate glued to a neighbouring
+    word character is rejected and the search resumes one character later, so
+    "aa" is still found in "aaa aa" (at the standalone one).
     """
     if not find_text:
         return []
@@ -429,29 +485,127 @@ def _find_all_occurrences(text: str, find_text: str, case_sensitive: bool = True
         idx = haystack.find(needle, start)
         if idx == -1:
             break
+        end = idx + len(needle)
+        if whole_word and not _is_whole_word(haystack, idx, end):
+            start = idx + 1
+            continue
         offsets.append(idx)
-        start = idx + len(needle)
+        start = end
     return offsets
 
 
-def scan_documents(folder_path: str, find_text: str, case_sensitive: bool = True) -> List[FileResult]:
+def _normalise_rules(rules: Union[str, Rule, Sequence[Rule]],
+                     case_sensitive: bool = True) -> List[Rule]:
+    """
+    Turn whatever the caller passed into a clean list of rules.
+
+    A bare string is the single-term form (with an empty replacement, which is
+    fine for a scan). Rules with an empty search text are dropped. Two rules
+    with the same search text - compared case-insensitively when the scan is -
+    would flag every one of their matches as a conflict, so that is a
+    ``ValueError`` here rather than a screen full of warnings later.
+    """
+    if isinstance(rules, str):
+        rules = [Rule(rules)]
+    elif isinstance(rules, Rule):
+        rules = [rules]
+
+    cleaned: List[Rule] = []
+    seen: Dict[str, str] = {}
+    for rule in rules:
+        if not rule.find_text:
+            continue
+        key = rule.find_text if case_sensitive else rule.find_text.lower()
+        if key in seen:
+            if seen[key] == rule.find_text:
+                raise ValueError(f'Duplicate rule for "{rule.find_text}".')
+            raise ValueError(
+                f'Rules "{seen[key]}" and "{rule.find_text}" are the same text '
+                f'when case is ignored.')
+        seen[key] = rule.find_text
+        cleaned.append(rule)
+    return cleaned
+
+
+def _is_docx_name(name: str) -> bool:
+    return name.lower().endswith('.docx') and not name.startswith('~$')
+
+
+def _list_docx(folder_path: str, recursive: bool = False) -> List[str]:
+    """
+    Every .docx under the folder, sorted, skipping Word's ``~$`` lock files.
+
+    Raises the underlying OSError for the top folder. With ``recursive``,
+    subfolders are walked in sorted order without following symlinks; a
+    subfolder that cannot be listed is skipped rather than aborting the scan.
+    """
+    if not recursive:
+        return sorted(
+            os.path.join(folder_path, f)
+            for f in os.listdir(folder_path) if _is_docx_name(f)
+        )
+
+    # Probe the top folder so a permission error there surfaces as it does in
+    # the non-recursive case; os.walk would otherwise swallow it.
+    os.listdir(folder_path)
+
+    found: List[str] = []
+    for root, dirs, files in os.walk(folder_path, followlinks=False):
+        dirs.sort()
+        for f in sorted(files):
+            if _is_docx_name(f):
+                found.append(os.path.join(root, f))
+    return found
+
+
+def _mark_conflicts(matches: List[Match]) -> None:
+    """
+    Flag matches in one paragraph whose character ranges overlap.
+
+    Overlaps can only come from different rules ("2022" and "2022 CBC"): a
+    single rule's occurrences never overlap. Neither side is applied - which
+    one the user meant is not the tool's guess to make - so both are marked
+    and deselected. `matches` must be sorted by offset.
+    """
+    for i in range(1, len(matches)):
+        prev, cur = matches[i - 1], matches[i]
+        prev_end = prev.char_offset + len(prev.match_text)
+        if cur.char_offset < prev_end:
+            prev.conflict = cur.conflict = True
+            prev.is_selected = cur.is_selected = False
+
+
+def scan_documents(folder_path: str, find_text: Union[str, Sequence[Rule]],
+                   case_sensitive: bool = True, whole_word: bool = False,
+                   recursive: bool = False) -> List[FileResult]:
     """
     Scan all .docx files in a folder for occurrences of find_text.
 
-    Returns one FileResult per file that either matched or failed to open.
-    Use `scan_documents_detailed` when the caller also needs the file count.
+    `find_text` may be a single search string or a list of `Rule`s. Returns one
+    FileResult per file that either matched or failed to open. Use
+    `scan_documents_detailed` when the caller also needs the file count.
     """
-    return scan_documents_detailed(folder_path, find_text, case_sensitive)[0]
+    return scan_documents_detailed(folder_path, find_text, case_sensitive,
+                                   whole_word=whole_word, recursive=recursive)[0]
 
 
-def scan_documents_detailed(folder_path: str, find_text: str,
+def scan_documents_detailed(folder_path: str, rules: Union[str, Sequence[Rule]],
                             case_sensitive: bool = True,
+                            whole_word: bool = False,
+                            recursive: bool = False,
                             progress_callback=None,
                             cancel_event=None) -> Tuple[List[FileResult], dict]:
     """
     Scan a folder and also report how many .docx files were examined.
 
     Args:
+        rules: A single search string, or a list of `Rule`s run as one set.
+            Each Match records the rule it came from in `find_text` and
+            `replace_text`. Matches from different rules that overlap in the
+            same paragraph are flagged `conflict` and deselected.
+        whole_word: Reject occurrences glued to a neighbouring word character.
+        recursive: Also scan subfolders. `FileResult.file_name` is then the
+            path relative to `folder_path`.
         progress_callback: Optional callable(file_name, file_index, total_files),
             called before each file so a GUI can show progress over a large set.
         cancel_event: Optional object with `is_set()`. Checked between files;
@@ -460,18 +614,17 @@ def scan_documents_detailed(folder_path: str, find_text: str,
     Returns ``(results, summary)`` where summary has keys 'files_scanned',
     'files_with_matches' and 'cancelled'. The caller needs 'files_scanned' to
     tell "no .docx files in this folder" apart from "no matches in any of them".
+
+    Raises ``ValueError`` for two rules with the same search text.
     """
     summary = {'files_scanned': 0, 'files_with_matches': 0, 'cancelled': False}
 
-    if not find_text:
+    rule_list = _normalise_rules(rules, case_sensitive)
+    if not rule_list:
         return [], summary
 
     try:
-        docx_files = sorted([
-            os.path.join(folder_path, f)
-            for f in os.listdir(folder_path)
-            if f.lower().endswith('.docx') and not f.startswith('~$')
-        ])
+        docx_files = _list_docx(folder_path, recursive)
     except PermissionError as e:
         return [FileResult(file_path=folder_path, file_name=os.path.basename(folder_path),
                            error=f"Permission denied: {e}")], summary
@@ -489,14 +642,14 @@ def scan_documents_detailed(folder_path: str, find_text: str,
             summary['cancelled'] = True
             break
 
+        file_name = (os.path.relpath(file_path, folder_path) if recursive
+                     else os.path.basename(file_path))
+
         if progress_callback:
-            progress_callback(os.path.basename(file_path), file_idx, len(docx_files))
+            progress_callback(file_name, file_idx, len(docx_files))
 
         summary['files_scanned'] += 1
-        file_result = FileResult(
-            file_path=file_path,
-            file_name=os.path.basename(file_path)
-        )
+        file_result = FileResult(file_path=file_path, file_name=file_name)
 
         # Recorded so apply_changes can tell whether the file changed underneath
         # the preview. A stale offset must never be applied blind.
@@ -533,22 +686,33 @@ def scan_documents_detailed(folder_path: str, find_text: str,
             if not full_text:
                 continue
 
-            for char_offset in _find_all_occurrences(full_text, find_text, case_sensitive):
-                context_before, context_after = _get_context(
-                    full_text, char_offset, len(find_text)
-                )
-                file_result.matches.append(Match(
-                    file_path=file_path,
-                    location_type=loc_type,
-                    location_detail=loc_detail,
-                    paragraph_key=para_key,
-                    char_offset=char_offset,
-                    context_before=context_before,
-                    match_text=full_text[char_offset:char_offset + len(find_text)],
-                    context_after=context_after,
-                    file_mtime=file_mtime,
-                    file_size=file_size,
-                ))
+            para_matches: List[Match] = []
+            for rule in rule_list:
+                find_text = rule.find_text
+                for char_offset in _find_all_occurrences(
+                        full_text, find_text, case_sensitive, whole_word):
+                    context_before, context_after = _get_context(
+                        full_text, char_offset, len(find_text)
+                    )
+                    para_matches.append(Match(
+                        file_path=file_path,
+                        location_type=loc_type,
+                        location_detail=loc_detail,
+                        paragraph_key=para_key,
+                        char_offset=char_offset,
+                        context_before=context_before,
+                        match_text=full_text[char_offset:char_offset + len(find_text)],
+                        context_after=context_after,
+                        file_mtime=file_mtime,
+                        file_size=file_size,
+                        find_text=find_text,
+                        replace_text=rule.replace_text,
+                    ))
+
+            # Document order, whichever rule found them; then flag overlaps.
+            para_matches.sort(key=lambda m: (m.char_offset, -len(m.match_text)))
+            _mark_conflicts(para_matches)
+            file_result.matches.extend(para_matches)
 
         if file_result.matches:
             summary['files_with_matches'] += 1
@@ -568,76 +732,352 @@ def _set_node_text(el, text: str) -> None:
     el.set(_XML_SPACE, "preserve")
 
 
-def _replace_in_paragraph(p_el, find_text: str, replace_text: str,
-                          target_offsets: List[int],
-                          case_sensitive: bool = True) -> Tuple[List[int], List[int]]:
+@dataclass(frozen=True)
+class _Edit:
+    """One requested replacement inside a paragraph."""
+    offset: int
+    find_text: str
+    replace_text: str
+
+
+@dataclass
+class _EditOutcome:
+    offset: int
+    applied: bool
+    reason: str = ""
+
+
+_REASON_OVERLAP = "overlaps another selected change"
+_REASON_MOVED = "text no longer at the recorded position"
+_REASON_NO_RUN = "match consists only of tabs or breaks"
+
+
+def _edit_in_place(covered: List[_TextNode], offset: int, end: int,
+                   replace_text: str) -> None:
     """
-    Replace specific occurrences of find_text in one paragraph.
+    Write `replace_text` over the character range ``[offset, end)``.
 
-    Occurrences are addressed by character offset into the paragraph text as
-    produced by `_paragraph_text_and_nodes`, and are applied in descending
-    offset order so that earlier offsets stay valid.
-
-    Text is written directly into ``w:t`` elements. Runs are never reassigned,
-    so anything else a run carries (inline images, footnote and comment
-    references, field characters) survives untouched.
-
-    Returns ``(applied_offsets, skipped_offsets)``.
+    The replacement goes into the first covered ``w:t``; later covered ``w:t``
+    elements keep only their uncovered text. Runs are never reassigned, so
+    anything else a run carries (inline images, footnote and comment
+    references, field characters) survives untouched. Atomic leaves (tabs,
+    breaks) inside the range are single characters, so any overlap covers the
+    whole element and it is dropped - the replacement supersedes it.
     """
-    applied: List[int] = []
-    skipped: List[int] = []
-    find_len = len(find_text)
+    placed = False
+    for node in covered:
+        overlap_start = max(offset, node.start)
+        overlap_end = min(end, node.start + node.length)
 
-    if find_len == 0:
-        return applied, list(target_offsets)
+        if node.editable:
+            text = node.element.text or ""
+            prefix = text[:overlap_start - node.start]
+            suffix = text[overlap_end - node.start:]
+            if placed:
+                _set_node_text(node.element, prefix + suffix)
+            else:
+                _set_node_text(node.element, prefix + replace_text + suffix)
+                placed = True
+        else:
+            parent = node.element.getparent()
+            if parent is not None:
+                parent.remove(node.element)
 
-    for offset in sorted(set(target_offsets), reverse=True):
+
+# --------------------------------------------------------------------------
+# Tracked-changes mode: replacements written as Word revisions
+# --------------------------------------------------------------------------
+
+_R = _w('r')
+_RPR = _w('rPr')
+_INS = _w('ins')
+_DEL = _w('del')
+_MOVE_TO = _w('moveTo')
+_DEL_TEXT = _w('delText')
+_RPR_CHANGE = _w('rPrChange')
+
+_REASON_CONFLICT = "overlaps a match from another rule"
+_REASON_COMMENT_TRACKED = "revisions cannot be tracked inside a comment"
+_REASON_NESTED_INS = ("inside an existing tracked insertion - accept or reject it "
+                      "in Word first, or run without tracked changes")
+_REASON_STRUCTURE = "unexpected document structure around the match"
+
+
+@dataclass
+class _TrackedContext:
+    """Author, timestamp and id allocator shared by every revision in one file."""
+    author: str
+    date: str
+    next_id: int
+
+    def take_id(self) -> str:
+        value = self.next_id
+        self.next_id += 1
+        return str(value)
+
+
+def _default_author() -> str:
+    try:
+        name = getpass.getuser()
+    except Exception:
+        name = ""
+    return name or "DocxFindReplace"
+
+
+def _max_revision_id(doc) -> int:
+    """
+    The highest numeric ``w:id`` anywhere in the package.
+
+    Revision ids must be unique across the document. Every part is checked
+    and every ``w:id`` counts (bookmarks and comments included), which
+    over-approximates harmlessly and avoids enumerating annotation types.
+    """
+    highest = 0
+    w_id = _w('id')
+    for part in doc.part.package.iter_parts():
+        root = getattr(part, 'element', None)
+        if root is None:
+            continue
+        for el in root.iter():
+            value = el.get(w_id) if hasattr(el, 'get') else None
+            if value is None:
+                continue
+            try:
+                highest = max(highest, int(value))
+            except (TypeError, ValueError):
+                continue
+    return highest
+
+
+def _tracked_context_for(doc, author: Optional[str] = None) -> _TrackedContext:
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _TrackedContext(author or _default_author(), date, _max_revision_id(doc) + 1)
+
+
+def _new_t(text: str):
+    t = OxmlElement('w:t')
+    _set_node_text(t, text)
+    return t
+
+
+def _copy_rpr(rpr):
+    """
+    A copy of a run's ``w:rPr`` safe to attach to a new run.
+
+    ``w:rPrChange`` (a tracked formatting change) carries its own revision id,
+    so it is dropped from the copy rather than duplicated.
+    """
+    if rpr is None:
+        return None
+    copied = copy.deepcopy(rpr)
+    for change in copied.findall(_RPR_CHANGE):
+        copied.remove(change)
+    return copied
+
+
+def _new_run(rpr, children) -> object:
+    """A new ``w:r`` carrying a copy of `rpr` and the given children (moved)."""
+    run = OxmlElement('w:r')
+    rpr_copy = _copy_rpr(rpr)
+    if rpr_copy is not None:
+        run.append(rpr_copy)
+    for child in children:
+        run.append(child)        # lxml moves an element that already has a parent
+    return run
+
+
+def _isolate_run_slice(node_el, a: int, b: int):
+    """
+    Split a run so that `node_el` - trimmed to ``text[a:b]`` when it is a
+    ``w:t`` - is the only content of its run, and return that run.
+
+    Everything else the run carried (other text, a drawing, a footnote or
+    comment reference, a field character) moves into sibling runs before and
+    after, each with a copy of the run's formatting. Those siblings are never
+    wrapped in a revision, which is what keeps tracked mode from marking an
+    image or a footnote reference as deleted.
+    """
+    run = node_el.getparent()
+    rpr = run.find(_RPR)
+    children = [c for c in run if c is not rpr]
+    index = children.index(node_el)
+    before, after = children[:index], children[index + 1:]
+
+    if node_el.tag == _T:
+        text = node_el.text or ""
+        if a > 0:
+            before.append(_new_t(text[:a]))
+        if b < len(text):
+            after.insert(0, _new_t(text[b:]))
+        _set_node_text(node_el, text[a:b])
+
+    if before:
+        run.addprevious(_new_run(rpr, before))
+    if after:
+        run.addnext(_new_run(rpr, after))
+    return run
+
+
+def _set_revision_attrs(el, ctx: _TrackedContext) -> None:
+    el.set(_w('id'), ctx.take_id())
+    el.set(_w('author'), ctx.author)
+    el.set(_w('date'), ctx.date)
+
+
+def _wrap_in_del(run, ctx: _TrackedContext):
+    """Wrap an isolated run in ``w:del``, turning its ``w:t`` into ``w:delText``."""
+    wrapper = OxmlElement('w:del')
+    _set_revision_attrs(wrapper, ctx)
+    run.addprevious(wrapper)
+    wrapper.append(run)
+    for t in run.findall(_T):
+        del_text = OxmlElement('w:delText')
+        del_text.text = t.text
+        del_text.set(_XML_SPACE, "preserve")
+        run.replace(t, del_text)
+    return wrapper
+
+
+def _make_ins(ctx: _TrackedContext, rpr_src, text: str):
+    """A ``w:ins`` holding one run of `text` formatted like `rpr_src`."""
+    ins = OxmlElement('w:ins')
+    _set_revision_attrs(ins, ctx)
+    run = OxmlElement('w:r')
+    rpr_copy = _copy_rpr(rpr_src)
+    if rpr_copy is not None:
+        run.append(rpr_copy)
+    run.append(_new_t(text))
+    ins.append(run)
+    return ins
+
+
+def _edit_tracked(p_el, covered: List[_TextNode], offset: int, end: int,
+                  replace_text: str, ctx: _TrackedContext) -> str:
+    """
+    Write the replacement of ``[offset, end)`` as a Word revision.
+
+    Each covered node is first isolated into a run of its own, then that run
+    is wrapped in a tracked deletion; a tracked insertion holding the new text
+    follows the last deletion, formatted like the first deleted text run. The
+    traversal skips ``w:del`` and enters ``w:ins``, so the paragraph text
+    afterwards reads exactly as an in-place replacement would.
+
+    Returns "" on success, or a skip reason - in which case nothing was
+    touched. Two structures are refused rather than guessed at: a match inside
+    an existing tracked insertion (Word has no representation for an insertion
+    nested in another), and a node whose parent is not a run.
+    """
+    for node in covered:
+        parent = node.element.getparent()
+        if parent is None or parent.tag != _R:
+            return _REASON_STRUCTURE
+        if _has_intervening(node.element, {_INS, _MOVE_TO}, p_el):
+            return _REASON_NESTED_INS
+
+    first_rpr = None
+    last_del = None
+    for node in covered:
+        a = max(offset, node.start) - node.start
+        b = min(end, node.start + node.length) - node.start
+        run = _isolate_run_slice(node.element, a, b)
+        if first_rpr is None and node.editable:
+            first_rpr = run.find(_RPR)
+        last_del = _wrap_in_del(run, ctx)
+
+    if replace_text and last_del is not None:
+        last_del.addnext(_make_ins(ctx, first_rpr, replace_text))
+    return ""
+
+
+def _apply_edits(p_el, edits: Sequence[_Edit], case_sensitive: bool = True,
+                 tracked=None) -> List[_EditOutcome]:
+    """
+    Apply several replacements to one paragraph, each addressed by offset.
+
+    Offsets index the paragraph text as produced by `_paragraph_text_and_nodes`
+    and are applied in descending order so that earlier offsets stay valid.
+    Before anything is touched, every edit is re-verified against the current
+    paragraph text; an edit whose text is no longer at its offset is skipped,
+    never guessed. Two requested edits whose ranges overlap are both skipped:
+    applying one would silently destroy the other.
+
+    Only the text is re-verified, deliberately: a whole-word boundary is not
+    re-checked, because an adjacent edit applied a moment earlier in this same
+    paragraph can legitimately have changed the neighbouring character.
+
+    `tracked`, when given, is a `_TrackedContext`; the edit is then written as
+    a Word revision instead of in place (see `_edit_tracked`).
+
+    Returns one `_EditOutcome` per distinct edit.
+    """
+    outcomes: List[_EditOutcome] = []
+    distinct = list(dict.fromkeys(edits))     # dedupe, preserving order
+
+    # Overlap guard on the requested ranges, before any mutation.
+    by_offset = sorted(distinct, key=lambda e: (e.offset, -len(e.find_text)))
+    overlapping = set()
+    for i in range(1, len(by_offset)):
+        prev, cur = by_offset[i - 1], by_offset[i]
+        if cur.offset < prev.offset + len(prev.find_text):
+            overlapping.add(prev)
+            overlapping.add(cur)
+
+    for edit in sorted(distinct, key=lambda e: e.offset, reverse=True):
+        if edit in overlapping:
+            outcomes.append(_EditOutcome(edit.offset, False, _REASON_OVERLAP))
+            continue
+        find_len = len(edit.find_text)
+        if find_len == 0:
+            outcomes.append(_EditOutcome(edit.offset, False, _REASON_MOVED))
+            continue
+
         full_text, nodes = _paragraph_text_and_nodes(p_el)
-        end = offset + find_len
+        offset, end = edit.offset, edit.offset + find_len
 
         # Re-verify the match is still present at this offset before touching it.
         if offset < 0 or end > len(full_text):
-            skipped.append(offset)
+            outcomes.append(_EditOutcome(offset, False, _REASON_MOVED))
             continue
         actual = full_text[offset:end]
         if case_sensitive:
-            if actual != find_text:
-                skipped.append(offset)
-                continue
-        elif actual.lower() != find_text.lower():
-            skipped.append(offset)
+            same = actual == edit.find_text
+        else:
+            same = actual.lower() == edit.find_text.lower()
+        if not same:
+            outcomes.append(_EditOutcome(offset, False, _REASON_MOVED))
             continue
 
         covered = [n for n in nodes if n.start < end and n.start + n.length > offset]
         if not any(n.editable for n in covered):
-            # Match consists only of atomic leaves (tabs/breaks); nowhere to put
-            # the replacement without inventing a run. Leave it alone.
-            skipped.append(offset)
+            # Nowhere to put the replacement without inventing a run.
+            outcomes.append(_EditOutcome(offset, False, _REASON_NO_RUN))
             continue
 
-        placed = False
-        for node in covered:
-            overlap_start = max(offset, node.start)
-            overlap_end = min(end, node.start + node.length)
+        if tracked is None:
+            _edit_in_place(covered, offset, end, edit.replace_text)
+            outcomes.append(_EditOutcome(offset, True))
+        else:
+            reason = _edit_tracked(p_el, covered, offset, end,
+                                   edit.replace_text, tracked)
+            outcomes.append(_EditOutcome(offset, not reason, reason))
 
-            if node.editable:
-                text = node.element.text or ""
-                prefix = text[:overlap_start - node.start]
-                suffix = text[overlap_end - node.start:]
-                if placed:
-                    _set_node_text(node.element, prefix + suffix)
-                else:
-                    _set_node_text(node.element, prefix + replace_text + suffix)
-                    placed = True
-            else:
-                # Atomic leaves are single characters, so any overlap covers the
-                # whole element: drop it, the replacement text supersedes it.
-                parent = node.element.getparent()
-                if parent is not None:
-                    parent.remove(node.element)
+    return outcomes
 
-        applied.append(offset)
 
+def _replace_in_paragraph(p_el, find_text: str, replace_text: str,
+                          target_offsets: List[int],
+                          case_sensitive: bool = True,
+                          tracked=None) -> Tuple[List[int], List[int]]:
+    """
+    Replace specific occurrences of one search text in one paragraph.
+
+    The single-rule form of `_apply_edits`. Returns
+    ``(applied_offsets, skipped_offsets)``.
+    """
+    edits = [_Edit(off, find_text, replace_text) for off in target_offsets]
+    outcomes = _apply_edits(p_el, edits, case_sensitive, tracked)
+    applied = [o.offset for o in outcomes if o.applied]
+    skipped = [o.offset for o in outcomes if not o.applied]
     return applied, skipped
 
 
@@ -708,42 +1148,57 @@ def _save_atomically(doc, file_path: str) -> None:
         raise
 
 
-def apply_changes(matches: List[Match], replace_text: str,
+def apply_changes(matches: List[Match], replace_text: Optional[str] = None,
                   create_backups: bool = True, case_sensitive: bool = True,
+                  tracked_changes: bool = False, author: Optional[str] = None,
                   progress_callback=None) -> dict:
     """
     Apply selected replacements to documents.
 
     Args:
         matches: Match objects (only those with is_selected=True are applied)
-        replace_text: The replacement text
+        replace_text: Override replacement text for every match. When None,
+            each match's own `replace_text` (the rule it came from) is used.
         create_backups: Whether to create timestamped .bak files
         case_sensitive: Whether matching is case-sensitive
+        tracked_changes: Write each replacement as a Word revision (a tracked
+            deletion of the old text and insertion of the new) instead of
+            editing the text in place.
+        author: Revision author for tracked changes. Defaults to the current
+            user's login name.
         progress_callback: Optional callable(file_name, file_index, total_files)
 
     Returns:
         dict with keys 'total_replaced', 'total_skipped', 'files_modified',
-        'backups', and 'errors'. Every selected match is accounted for as
-        either replaced or skipped, and each Match's `applied` attribute is set.
+        'backups', 'backup_map', 'skip_reasons' and 'errors'. Every selected
+        match is accounted for as either replaced or skipped, each Match's
+        `applied` attribute is set, and a skipped match carries a
+        `skip_reason`. 'skip_reasons' counts skipped matches by reason.
     """
     selected = [m for m in matches if m.is_selected]
     for m in selected:
         m.applied = None
+        m.skip_reason = ""
 
+    result = {'total_replaced': 0, 'total_skipped': 0, 'files_modified': 0,
+              'backups': [], 'backup_map': {}, 'skip_reasons': {}, 'errors': []}
     if not selected:
-        return {'total_replaced': 0, 'total_skipped': 0, 'files_modified': 0,
-                'backups': [], 'errors': []}
+        return result
 
     files_dict: Dict[str, List[Match]] = {}
     for match in selected:
         files_dict.setdefault(match.file_path, []).append(match)
 
-    total_replaced = 0
-    total_skipped = 0
-    files_modified = 0
-    backups: List[str] = []
-    errors: List[str] = []
+    if tracked_changes and not author:
+        author = _default_author()
+
+    errors: List[str] = result['errors']
     total_files = len(files_dict)
+
+    def skip_all(file_matches: List[Match], reason: str) -> None:
+        for m in file_matches:
+            m.applied = False
+            m.skip_reason = reason
 
     for file_idx, (file_path, file_matches) in enumerate(files_dict.items()):
         file_name = os.path.basename(file_path)
@@ -760,31 +1215,41 @@ def apply_changes(matches: List[Match], replace_text: str,
             if stale:
                 errors.append(f"{file_name}: {stale} Nothing was changed in this "
                               f"file - re-run Preview Changes.")
-                for m in file_matches:
-                    m.applied = False
+                skip_all(file_matches, "file changed since the preview")
                 continue
 
             try:
                 doc = Document(file_path)
             except Exception as e:
                 errors.append(f"Could not open {file_name}: {e}")
-                for m in file_matches:
-                    m.applied = False
+                skip_all(file_matches, "file could not be opened")
                 continue
 
             try:
                 all_paragraphs = _collect_paragraphs(doc)
             except Exception as e:
                 errors.append(f"Could not read structure of {file_name}: {e}")
-                for m in file_matches:
-                    m.applied = False
+                skip_all(file_matches, "document structure could not be read")
                 continue
+
+            tracked = _tracked_context_for(doc, author) if tracked_changes else None
 
             para_lookup = {key: p_el for p_el, _t, _d, key in all_paragraphs}
 
-            # Group this file's matches by the paragraph they belong to.
             by_paragraph: Dict[str, List[Match]] = {}
             for match in file_matches:
+                if match.conflict:
+                    # Flagged at scan time; never applied, whatever the
+                    # checkbox says.
+                    match.applied = False
+                    match.skip_reason = _REASON_CONFLICT
+                    continue
+                if tracked is not None and match.location_type == 'comment':
+                    # Word does not track revisions inside comment text, so a
+                    # revision there would be a guess about how Word shows it.
+                    match.applied = False
+                    match.skip_reason = _REASON_COMMENT_TRACKED
+                    continue
                 by_paragraph.setdefault(match.paragraph_key, []).append(match)
 
             file_replaced = 0
@@ -792,24 +1257,26 @@ def apply_changes(matches: List[Match], replace_text: str,
             for para_key, para_matches in by_paragraph.items():
                 p_el = para_lookup.get(para_key)
                 if p_el is None:
-                    # The document changed between scanning and applying.
-                    for m in para_matches:
-                        m.applied = False
+                    skip_all(para_matches, "paragraph not found in the document")
                     continue
 
-                find_text = para_matches[0].match_text
-                applied_offsets, _skipped = _replace_in_paragraph(
-                    p_el, find_text, replace_text,
-                    [m.char_offset for m in para_matches],
-                    case_sensitive,
-                )
-                applied_set = set(applied_offsets)
+                edits = [
+                    _Edit(m.char_offset, m.effective_find_text,
+                          replace_text if replace_text is not None else m.replace_text)
+                    for m in para_matches
+                ]
+                outcomes = {o.offset: o for o in
+                            _apply_edits(p_el, edits, case_sensitive, tracked)}
                 for m in para_matches:
-                    m.applied = m.char_offset in applied_set
-                file_replaced += len(applied_set)
+                    outcome = outcomes.get(m.char_offset)
+                    if outcome is not None and outcome.applied:
+                        m.applied = True
+                    else:
+                        m.applied = False
+                        m.skip_reason = outcome.reason if outcome else _REASON_MOVED
+                file_replaced += sum(1 for o in outcomes.values() if o.applied)
 
             if file_replaced > 0:
-                # Back up only once we know the file is genuinely about to change.
                 backup_path = None
                 if create_backups:
                     backup_path = _make_backup_path(file_path)
@@ -818,34 +1285,30 @@ def apply_changes(matches: List[Match], replace_text: str,
                     except Exception as e:
                         errors.append(f"Could not create backup for {file_name}: {e} "
                                       f"(file left unchanged)")
-                        for m in file_matches:
-                            m.applied = False
+                        skip_all(file_matches, "backup could not be written")
                         continue
 
                 try:
                     _save_atomically(doc, file_path)
-                    files_modified += 1
-                    total_replaced += file_replaced
+                    result['files_modified'] += 1
+                    result['total_replaced'] += file_replaced
                     if backup_path:
-                        backups.append(backup_path)
+                        result['backups'].append(backup_path)
+                        result['backup_map'][file_path] = backup_path
                 except PermissionError:
                     errors.append(f"Permission denied saving {file_name} (file may be open)")
-                    for m in file_matches:
-                        m.applied = False
+                    skip_all(file_matches, "permission denied saving the file")
                 except Exception as e:
                     errors.append(f"Error saving {file_name}: {e}")
-                    for m in file_matches:
-                        m.applied = False
+                    skip_all(file_matches, "file could not be saved")
         finally:
-            total_skipped += sum(1 for m in file_matches if not m.applied)
+            for m in file_matches:
+                if not m.applied:
+                    result['total_skipped'] += 1
+                    reason = m.skip_reason or "not applied"
+                    result['skip_reasons'][reason] = result['skip_reasons'].get(reason, 0) + 1
 
     if progress_callback:
         progress_callback("Done", total_files - 1 if total_files else 0, total_files)
 
-    return {
-        'total_replaced': total_replaced,
-        'total_skipped': total_skipped,
-        'files_modified': files_modified,
-        'backups': backups,
-        'errors': errors,
-    }
+    return result
