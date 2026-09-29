@@ -11,9 +11,14 @@ specification sets for nonresidential projects, where a silent wrong edit is
 worse than a loud failure.
 
 - `main.py` — tkinter GUI. Scanning and applying run on daemon worker threads;
-  all widget updates go back to the main thread via `root.after`.
-- `document_processor.py` — all document logic. No tkinter imports; it is
-  independently testable and that is deliberate.
+  all widget updates go back to the main thread via `root.after`, and a worker
+  never reads a tk variable: `_start_apply` snapshots its options into a dict
+  and passes it to the worker.
+- `document_processor.py` — all document logic: traversal, scan, in-place and
+  tracked-changes apply, change log, backup discovery and restore. No tkinter
+  imports; it is independently testable and that is deliberate.
+- `settings.py` — rule-set CSV files and the remembered-settings JSON. Stdlib
+  plus `Rule` only; also no tkinter.
 - `tests/` — pytest suite that builds real `.docx` fixtures on disk, plus
   `tkstub.py`, a headless tkinter stand-in that lets `test_gui.py` exercise the
   window's decisions without a display.
@@ -43,6 +48,10 @@ a document that were assumed to agree and did not:
 
 Do not reintroduce `paragraph.text`, `paragraph.runs`, `doc.paragraphs`,
 `doc.tables` or `row.cells` into the scan or replace paths. Walk the XML.
+
+`_locate_paragraphs` is the traversal's full result (element, type, detail,
+key, section); `_collect_paragraphs` is its four-field projection and stays
+that way, because tests and the selftest unpack it as a 4-tuple.
 
 ## Rules that exist because breaking them destroyed documents
 
@@ -87,6 +96,42 @@ Do not reintroduce `paragraph.text`, `paragraph.runs`, `doc.paragraphs`,
 10. **The results tree is inert while a worker runs.** `_on_tree_click`,
     `_select_all` and `_deselect_all` return early when `is_processing`, because
     the worker thread reads the same Match objects those handlers mutate.
+11. **Never reach the styles part through `doc.styles`.** Like `section.header`,
+    that property *creates* a default styles part when one is missing, and a
+    scan must not change what gets saved. `_styles_root` resolves it through
+    `doc.part.rels` and tolerates its absence;
+    `test_scanning_a_document_without_styles_does_not_add_a_styles_part` guards it.
+12. **Overlapping matches are never applied, and the check is pairwise.**
+    `_mark_conflicts` at scan time and `_apply_edits` at apply time both use
+    `_overlapping_indices`, which compares every pair: with "2022 CBC", "2022"
+    and "CBC" all matching, the third overlaps the first but not the second, so
+    a neighbours-only check misses it. A conflict match is deselected, cannot be
+    selected in the GUI, and is refused by `apply_changes` even if selected by
+    hand. Which rule the user meant is not the tool's guess to make.
+13. **Whole-word is checked at scan time only.** `_apply_edits` re-verifies the
+    text at the offset and nothing else, because an adjacent edit applied a
+    moment earlier in the same paragraph can legitimately change the
+    neighbouring character; re-checking the boundary would skip a change the
+    preview promised.
+14. **Tracked mode wraps only isolated runs, and skips rather than nests.**
+    `_isolate_run_slice` moves everything else the run carried (drawing,
+    footnote reference, field character, other text) into sibling runs before
+    `_wrap_in_del` touches it, so an image is never marked deleted. A match with
+    a `w:ins`/`w:moveTo` ancestor is skipped with `_REASON_NESTED_INS` (Word
+    cannot represent an insertion inside an insertion) and a match in the
+    comments part with `_REASON_COMMENT_TRACKED` (Word does not track revisions
+    there). Nothing is mutated when an edit is refused. Revision ids are seeded
+    from the highest `w:id` anywhere in the package, and `_copy_rpr` strips
+    `w:rPrChange` because it carries an id of its own.
+15. **Scan settings are snapshotted at scan, apply settings at apply.**
+    `scan_folder`, `scan_rules`, `scan_case_sensitive`, `scan_whole_word` and
+    `scan_recursive` are recorded when Preview starts and are what the confirm
+    dialog and the worker use. Editing the rule *list* invalidates results;
+    typing in the editor boxes does not, because the editor is not a rule until
+    Add is clicked. `_apply_options` snapshots the apply-time options on the
+    main thread; the worker gets the dict.
+16. **GUI tests must never touch the real settings file.** `FindReplaceApp`
+    takes `settings_path`; the `app` fixture points it under `tmp_path`.
 
 ## Traversal specifics
 
@@ -121,6 +166,14 @@ library-supplied class when there is one.
 Word's `separator` and `continuationSeparator` footnote entries are rule lines,
 not content, and are skipped.
 
+Section context: `_walk_container` carries a `_HeadingTracker` for the body
+part only. A flow-level body paragraph (empty prefix) with outline level 0-8
+updates the stack; table cells and text boxes inherit `headings.path` without
+pushing. Outline level 9 means body text and stops `basedOn` inheritance -
+Word's own TOC Heading is Heading 1 plus an explicit level 9. Word's automatic
+numbering is not in the paragraph text, so it is not in the label; README says
+so.
+
 Note the asymmetry: a **complex** field (`w:fldChar` begin / `w:instrText` /
 separate / result / end) keeps its cached result in ordinary `w:r`/`w:t` runs,
 so the walk does scan and replace it. Word regenerates that text on field
@@ -141,8 +194,16 @@ not merely that the call returned without raising. All four Tier 1 bugs returned
 `replaced=1, errors=[]` while destroying content, so a green return value proves
 nothing. `tests/conftest.py` has builders for hyperlinks, merged cells, linked
 headers, images inside a spanned run, nested tables, text boxes (VML and
-`mc:AlternateContent`), footnotes/endnotes/comments, complex fields and tracked
-changes; extend it rather than hand-rolling XML in a test.
+`mc:AlternateContent`), footnotes/endnotes/comments, complex fields, tracked
+changes, formatted runs, `w:rPrChange`, heading styles and outline levels;
+extend it rather than hand-rolling XML in a test.
+
+Tracked-changes tests assert through `revisions()`, `all_revision_ids()`,
+`accept_all()` and `reject_all()` in conftest: the last two simulate Word's
+Accept All / Reject All over the saved package, so a test can state that
+accepting gives the in-place result and rejecting gives the original. A test
+that only checks `paragraph_text` after a tracked edit proves little, because
+the traversal hides deletions by design.
 
 For GUI work, `tests/test_gui.py` installs `tkstub` **before** importing `main`,
 so the stub must be in place first. The stub is deliberately minimal: a widget

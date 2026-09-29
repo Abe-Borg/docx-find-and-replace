@@ -200,6 +200,31 @@ def test_overlapping_hand_built_edits_leave_the_paragraph_untouched(docdir):
     assert dp.paragraph_text(p_el) == "2022 CBC"
 
 
+def test_three_way_overlap_flags_the_non_adjacent_pair_too(docdir):
+    """"2022 CBC", "2022" and "CBC": the third overlaps the first, not the second."""
+    path = _doc(docdir, "t.docx", "2022 CBC here")
+    rules = [dp.Rule("2022 CBC", "a"), dp.Rule("2022", "b"), dp.Rule("CBC", "c")]
+    matches = _scan(str(docdir), rules)
+    assert [(m.find_text, m.conflict) for m in matches] == [
+        ("2022 CBC", True), ("2022", True), ("CBC", True)]
+    for m in matches:
+        m.is_selected = True
+    result = dp.apply_changes(matches, create_backups=False)
+    assert result['total_replaced'] == 0 and result['total_skipped'] == 3
+    assert all_text(path)[0] == "2022 CBC here"
+
+
+def test_three_way_overlap_in_hand_built_edits(docdir):
+    path = _doc(docdir, "t.docx", "2022 CBC here")
+    doc = Document(path)
+    p_el = dp._collect_paragraphs(doc)[0][0]
+    outcomes = dp._apply_edits(p_el, [dp._Edit(0, "2022 CBC", "a"), dp._Edit(0, "2022", "b"),
+                                      dp._Edit(5, "CBC", "c"), dp._Edit(9, "here", "there")])
+    assert sorted((o.offset, o.applied) for o in outcomes) == [
+        (0, False), (0, False), (5, False), (9, True)]
+    assert dp.paragraph_text(p_el) == "2022 CBC there"
+
+
 def test_partial_overlap_is_also_refused(docdir):
     path = _doc(docdir, "e.docx", "abcdef")
     doc = Document(path)

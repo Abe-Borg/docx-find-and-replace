@@ -34,6 +34,12 @@ Offsets recorded by a scan describe one version of a file. `apply_changes`
 re-checks each file's size and mtime before touching it and refuses a file that
 changed in between, because a stale offset can still validate against different
 text.
+
+A scan runs a set of `Rule`s at once; matches from different rules that overlap
+are flagged and never applied. Replacements can be written in place or as Word
+tracked changes (a ``w:del`` of the old text and a ``w:ins`` of the new). The
+module also records the heading path above each body paragraph, writes a CSV
+change log of a run, and lists and restores the timestamped backups it wrote.
 """
 
 import copy
@@ -728,6 +734,25 @@ def _list_docx(folder_path: str, recursive: bool = False) -> List[str]:
     return _list_files(folder_path, recursive, _is_docx_name)
 
 
+def _overlapping_indices(ranges: Sequence[Tuple[int, int]]) -> set:
+    """
+    Indices of every range that intersects another one.
+
+    Pairwise on purpose: with "2022 CBC", "2022" and "CBC" all matching the
+    same text, the third overlaps the first but not the second, so a check
+    of neighbours only would miss it.
+    """
+    flagged = set()
+    for i in range(len(ranges)):
+        start_i, end_i = ranges[i]
+        for j in range(i + 1, len(ranges)):
+            start_j, end_j = ranges[j]
+            if start_j < end_i and start_i < end_j:
+                flagged.add(i)
+                flagged.add(j)
+    return flagged
+
+
 def _mark_conflicts(matches: List[Match]) -> None:
     """
     Flag matches in one paragraph whose character ranges overlap.
@@ -735,14 +760,12 @@ def _mark_conflicts(matches: List[Match]) -> None:
     Overlaps can only come from different rules ("2022" and "2022 CBC"): a
     single rule's occurrences never overlap. Neither side is applied - which
     one the user meant is not the tool's guess to make - so both are marked
-    and deselected. `matches` must be sorted by offset.
+    and deselected.
     """
-    for i in range(1, len(matches)):
-        prev, cur = matches[i - 1], matches[i]
-        prev_end = prev.char_offset + len(prev.match_text)
-        if cur.char_offset < prev_end:
-            prev.conflict = cur.conflict = True
-            prev.is_selected = cur.is_selected = False
+    ranges = [(m.char_offset, m.char_offset + len(m.match_text)) for m in matches]
+    for index in _overlapping_indices(ranges):
+        matches[index].conflict = True
+        matches[index].is_selected = False
 
 
 def scan_documents(folder_path: str, find_text: Union[str, Sequence[Rule]],
@@ -1185,13 +1208,8 @@ def _apply_edits(p_el, edits: Sequence[_Edit], case_sensitive: bool = True,
     distinct = list(dict.fromkeys(edits))     # dedupe, preserving order
 
     # Overlap guard on the requested ranges, before any mutation.
-    by_offset = sorted(distinct, key=lambda e: (e.offset, -len(e.find_text)))
-    overlapping = set()
-    for i in range(1, len(by_offset)):
-        prev, cur = by_offset[i - 1], by_offset[i]
-        if cur.offset < prev.offset + len(prev.find_text):
-            overlapping.add(prev)
-            overlapping.add(cur)
+    ranges = [(e.offset, e.offset + len(e.find_text)) for e in distinct]
+    overlapping = {distinct[i] for i in _overlapping_indices(ranges)}
 
     for edit in sorted(distinct, key=lambda e: e.offset, reverse=True):
         if edit in overlapping:
