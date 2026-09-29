@@ -39,6 +39,16 @@ class _Var:
         return f"trace{len(self._callbacks)}"
 
 
+class StringVar(_Var):
+    def __init__(self, value="", master=None, **kwargs):
+        super().__init__(value, master, **kwargs)
+
+
+class BooleanVar(_Var):
+    def __init__(self, value=False, master=None, **kwargs):
+        super().__init__(value, master, **kwargs)
+
+
 class _Widget:
     """Records configuration; accepts every geometry call without complaint."""
 
@@ -75,6 +85,15 @@ class _Widget:
     def set(self, *args):
         """Scrollbars are handed to Treeview as yscrollcommand/xscrollcommand."""
 
+    def focus_set(self):
+        pass
+
+    def destroy(self):
+        self.destroyed = True
+
+    def winfo_exists(self):
+        return not getattr(self, "destroyed", False)
+
     @property
     def state(self):
         return self.options.get("state", "normal")
@@ -96,11 +115,18 @@ class FakeTreeview(_Widget):
         # Tests set these to say what the next click lands on.
         self.next_identify_row = ""
         self.next_identify_element = ""
+        self._selection = ()
+        self._headings = {}
+        self._columns = {}
+        self._tags = {}
 
-    def insert(self, parent, index, text="", **kwargs):
+    def insert(self, parent, index, text="", values=(), tags=(), iid=None,
+               open=False, **kwargs):
         self._counter += 1
-        iid = f"I{self._counter:03d}"
-        self._items[iid] = {"text": text, "parent": parent, "children": [], "open": False}
+        iid = iid or f"I{self._counter:03d}"
+        self._items[iid] = {"text": text, "parent": parent, "children": [],
+                            "open": open, "values": tuple(values),
+                            "tags": (tags,) if isinstance(tags, str) else tuple(tags)}
         if parent:
             self._items[parent]["children"].append(iid)
         else:
@@ -146,8 +172,49 @@ class FakeTreeview(_Widget):
     def identify_element(self, x, y):
         return self.next_identify_element
 
-    def column(self, *args, **kwargs):
+    def column(self, column, **kwargs):
+        self._columns.setdefault(column, {}).update(kwargs)
+
+    def heading(self, column, **kwargs):
+        self._headings.setdefault(column, {}).update(kwargs)
+
+    def set(self, iid, column=None, value=None):
+        entry = self._items[iid]
+        columns = tuple(self.options.get("columns", ()))
+        if column is None:
+            return dict(zip(columns, entry["values"]))
+        index = columns.index(column)
+        if value is None:
+            return entry["values"][index]
+        values = list(entry["values"]) + [""] * (len(columns) - len(entry["values"]))
+        values[index] = value
+        entry["values"] = tuple(values)
+        return None
+
+    def tag_configure(self, tag, **kwargs):
+        self._tags.setdefault(tag, {}).update(kwargs)
+
+    def selection(self):
+        return tuple(i for i in self._selection if i in self._items)
+
+    def selection_set(self, *iids):
+        if len(iids) == 1 and isinstance(iids[0], (list, tuple)):
+            iids = tuple(iids[0])
+        self._selection = tuple(iids)
+
+    def selection_remove(self, *iids):
+        self._selection = tuple(i for i in self._selection if i not in iids)
+
+    def focus(self, iid=None):
+        if iid is not None:
+            self._focus = iid
+        return getattr(self, "_focus", "")
+
+    def see(self, iid):
         pass
+
+    def exists(self, iid):
+        return iid in self._items
 
     def yview(self, *args):
         pass
@@ -157,6 +224,12 @@ class FakeTreeview(_Widget):
 
     def text_of(self, iid):
         return self._items[iid]["text"]
+
+    def values_of(self, iid):
+        return self._items[iid]["values"]
+
+    def tags_of(self, iid):
+        return self._items[iid]["tags"]
 
 
 class FakeRoot(_Widget):
@@ -198,6 +271,48 @@ class _TkCall:
         self.calls.append(args)
 
 
+class FakeToplevel(_Widget):
+    """A secondary window; records the calls a dialog makes and its fate."""
+
+    def __init__(self, master=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self.destroyed = False
+        self.protocols = {}
+
+    def title(self, *a):
+        pass
+
+    def geometry(self, *a):
+        pass
+
+    def minsize(self, *a):
+        pass
+
+    def resizable(self, *a):
+        pass
+
+    def transient(self, *a):
+        pass
+
+    def grab_set(self):
+        pass
+
+    def grab_release(self):
+        pass
+
+    def lift(self):
+        pass
+
+    def wait_window(self, *a):
+        pass
+
+    def protocol(self, name, func):
+        self.protocols[name] = func
+
+    def destroy(self):
+        self.destroyed = True
+
+
 class Dialogs:
     """Records what the app tried to show, and scripts what the user answers."""
 
@@ -211,16 +326,16 @@ class Dialogs:
         self.questions = []
         self.answer = True
 
-    def showinfo(self, title, message):
+    def showinfo(self, title, message, **kwargs):
         self.info.append((title, message))
 
-    def showerror(self, title, message):
+    def showerror(self, title, message, **kwargs):
         self.errors.append((title, message))
 
-    def showwarning(self, title, message):
+    def showwarning(self, title, message, **kwargs):
         self.warnings.append((title, message))
 
-    def askyesno(self, title, message):
+    def askyesno(self, title, message, **kwargs):
         self.questions.append((title, message))
         return self.answer
 
@@ -234,9 +349,10 @@ def install():
     for name in ("BOTH", "X", "Y", "LEFT", "RIGHT", "TOP", "BOTTOM", "END",
                  "VERTICAL", "HORIZONTAL", "DISABLED", "NORMAL", "W", "E", "NS", "EW"):
         setattr(tk, name, name.lower())
-    tk.StringVar = _Var
-    tk.BooleanVar = _Var
+    tk.StringVar = StringVar
+    tk.BooleanVar = BooleanVar
     tk.Tk = FakeRoot
+    tk.Toplevel = FakeToplevel
     tk.Frame = _Widget
     # main.selftest() reports these; a frozen build that shipped without Tcl/Tk
     # would fail on them, which is the point of checking.
@@ -258,6 +374,8 @@ def install():
 
     filedialog = types.ModuleType("tkinter.filedialog")
     filedialog.askdirectory = lambda **kwargs: ""
+    filedialog.askopenfilename = lambda **kwargs: ""
+    filedialog.asksaveasfilename = lambda **kwargs: ""
 
     tk.ttk = ttk
     tk.messagebox = messagebox
