@@ -1,19 +1,134 @@
+Word Document Find & Replace (DocxFindReplace)
+END USER LICENSE AGREEMENT
+
 Copyright (C) 2025 Abraham Borg. All Rights Reserved.
 
-This software and associated documentation files (the "Software") are the
-proprietary property of Abraham Borg.
+Please read this agreement before installing or using the Software. By
+installing, copying or using the Software you agree to these terms. If you do
+not agree, do not install or use the Software.
 
-Unauthorized copying, modification, distribution, or use of this Software, via
-any medium, is strictly prohibited without express written permission from the
-copyright holder.
 
-This Software is provided for review and reference purposes only. No license or
-right to use, copy, modify, or distribute this Software for any purpose,
-commercial or non-commercial, is granted.
+1. DEFINITIONS
+
+"Licensor" means Abraham Borg, the copyright holder.
+
+"Software" means the Word Document Find & Replace program in executable form
+(the installer and the portable executable), as published by the Licensor on
+the official release page, https://github.com/Abe-Borg/docx-find-and-replace/releases,
+together with its documentation.
+
+"Source Code" means the program's source code as published by the Licensor in
+the official repository, https://github.com/Abe-Borg/docx-find-and-replace.
+
+"You" means the individual who installs or uses the Software and, where that
+individual does so on behalf of an employer or other organization, that
+organization.
+
+
+2. LICENSE GRANT
+
+Subject to the terms of this agreement, the Licensor grants You a free,
+non-exclusive, non-transferable, non-sublicensable license to:
+
+  (a) install and use the Software on any number of computers that You own or
+      control;
+
+  (b) use the Software for personal purposes or for the internal business
+      purposes of You or Your organization, including commercial work such as
+      editing documents for paid projects;
+
+  (c) run the unmodified Source Code with a Python interpreter, in place of the
+      executable form, for the same purposes; and
+
+  (d) where You administer computers for an organization, deploy the official,
+      unmodified installer or portable executable to that organization's
+      computers or to a network location accessible only to its personnel,
+      including by silent or automated installation, for use by its personnel.
+      Each person who uses the Software is bound by this agreement.
+
+The documents You process with the Software, and the backups and change logs it
+creates, are Yours. The Licensor claims no rights in them.
+
+
+3. RESTRICTIONS
+
+Except as this agreement expressly permits, or as applicable law permits
+regardless of this limitation, You may not:
+
+  (a) distribute, sell, rent, lease, lend, sublicense or otherwise make the
+      Software or the Source Code available to anyone outside Your
+      organization, including by publishing it on a website, file-sharing
+      service or software catalogue. Direct others to the official release
+      page instead;
+
+  (b) modify, adapt, translate or create derivative works of the Software or
+      the Source Code, or distribute a modified version of either;
+
+  (c) copy the Source Code, in whole or in part, into other software;
+
+  (d) remove, alter or obscure any copyright, license or attribution notice in
+      the Software or the Source Code; or
+
+  (e) use the Licensor's name to endorse or promote any product without the
+      Licensor's prior written permission.
+
+The Source Code is published so that it can be read and reviewed. Reading it
+grants no right beyond those in Section 2.
+
+
+4. THIRD-PARTY COMPONENTS
+
+The Software includes third-party open-source components, among them the Python
+runtime, python-docx and lxml. Each is licensed to You under its own license,
+reproduced in THIRD-PARTY-NOTICES.txt, which accompanies the Software and is
+shown under Help > Third-Party Notices. Nothing in this agreement limits the
+rights those licenses grant You in those components, and where this agreement
+conflicts with one of them, that license governs the component it covers.
+
+
+5. OWNERSHIP
+
+The Software is licensed, not sold. The Licensor retains all right, title and
+interest in the Software and the Source Code, including all intellectual
+property rights. All rights not expressly granted in this agreement are
+reserved.
+
+
+6. YOUR DOCUMENTS
+
+The Software modifies documents in place. You are responsible for reviewing the
+changes it previews before applying them, for keeping backups of Your
+documents, and for checking the results before relying on them, particularly in
+documents of contractual, regulatory or life-safety significance.
+
+
+7. NO WARRANTY
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
-FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT
-HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+
+8. LIMITATION OF LIABILITY
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, INCLUDING LOSS OF
+OR DAMAGE TO DOCUMENTS OR DATA, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+
+9. TERMINATION
+
+This license terminates automatically if You breach any of its terms. On
+termination You must stop using the Software and delete all copies in Your
+possession or control. Sections 5 to 8 survive termination. Later versions of
+the Software may be published under revised terms; each version is governed by
+the agreement that accompanies it.
+
+
+10. CONTACT AND OTHER PERMISSIONS
+
+To report a problem, ask a question, or request permission for any use this
+agreement does not grant, contact the Licensor through
+https://github.com/Abe-Borg/docx-find-and-replace/issues.

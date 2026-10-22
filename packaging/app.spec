@@ -23,6 +23,10 @@ from version import APP_ID                # noqa: E402
 # python-docx loads XML templates from its package directory at runtime, and
 # PyInstaller cannot see them from the import graph alone.
 datas = collect_data_files("docx")
+# The license and the third-party notices (written by make_notices.py) ship
+# inside the bundle: Help shows them and first launch asks for acceptance.
+datas += [(os.path.join(ROOT, "LICENSE.txt"), "."),
+          (os.path.join(SPECPATH, "THIRD-PARTY-NOTICES.txt"), ".")]
 
 a = Analysis(
     [os.path.join(ROOT, "main.py")],

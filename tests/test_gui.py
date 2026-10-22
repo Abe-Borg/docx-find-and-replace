@@ -991,3 +991,199 @@ def test_selftest_covers_tracked_mode_and_settings(tmp_path):
     text = report.read_text(encoding="utf-8")
     assert "tracked changes OK" in text
     assert "rule set and settings OK" in text
+
+
+def test_selftest_checks_the_bundled_license(tmp_path):
+    report = tmp_path / "selftest.txt"
+    assert main.selftest(str(report)) == 0
+    assert "license OK" in report.read_text(encoding="utf-8")
+
+
+def test_selftest_fails_when_the_license_is_missing(tmp_path, monkeypatch):
+    """A build that left LICENSE.txt out would refuse to start; CI must see it."""
+    def missing():
+        raise FileNotFoundError("LICENSE.txt not found")
+    monkeypatch.setattr(main.legal, "license_text", missing)
+    report = tmp_path / "fail.txt"
+    assert main.selftest(str(report)) == 1
+    assert "LICENSE.txt not found" in report.read_text(encoding="utf-8")
+
+
+def test_frozen_selftest_fails_without_the_notices(tmp_path, monkeypatch):
+    def missing():
+        raise FileNotFoundError("THIRD-PARTY-NOTICES.txt not found")
+    monkeypatch.setattr(main.legal, "notices_text", missing)
+    monkeypatch.setattr(main.sys, "frozen", True, raising=False)
+    assert main.selftest(str(tmp_path / "r.txt")) == 1
+
+
+def test_selftest_checks_notices_cover_the_bundled_packages(tmp_path, monkeypatch):
+    monkeypatch.setattr(main.legal, "notices_text", lambda: "Python\npython-docx\n")
+    report = tmp_path / "r.txt"
+    assert main.selftest(str(report)) == 1
+    assert "do not cover lxml" in report.read_text(encoding="utf-8")
+
+
+# ----------------------------------------------------- license and help
+
+def test_help_menu_offers_license_notices_contact_and_about(app):
+    labels = app.help_menu.labels()
+    assert "License Agreement" in labels
+    assert "Third-Party Notices" in labels
+    assert "Report a Problem or Contact..." in labels
+    assert f"About {main.APP_NAME}" in labels
+
+
+def test_about_names_version_copyright_and_contact(app):
+    app.help_menu.invoke_label(f"About {main.APP_NAME}")
+    (title, message), = tkstub.dialogs.info
+    assert main.__version__ in message
+    assert main.COPYRIGHT in message
+    assert main.SUPPORT_URL in message
+
+
+def test_license_window_shows_the_shipped_license_read_only(app, monkeypatch):
+    real_window = main.TextWindow
+    shown = []
+    monkeypatch.setattr(main, "TextWindow", lambda parent, title, text, **kw: shown.append(
+        real_window(parent, title, text, **kw)))
+    app.help_menu.invoke_label("License Agreement")
+    window, = shown
+    assert window.text.content == main.legal.license_text()
+    assert window.text.cget("state") == main.tk.DISABLED
+
+
+def test_notices_missing_from_a_source_run_are_explained(app, monkeypatch):
+    def missing():
+        raise FileNotFoundError("THIRD-PARTY-NOTICES.txt not found")
+    monkeypatch.setattr(main.legal, "notices_text", missing)
+    app.help_menu.invoke_label("Third-Party Notices")
+    (title, message), = tkstub.dialogs.info
+    assert "make_notices.py" in message
+
+
+def test_notices_are_shown_when_present(app, monkeypatch):
+    shown = []
+    monkeypatch.setattr(main.legal, "notices_text", lambda: "lxml license")
+    monkeypatch.setattr(main, "TextWindow", lambda parent, title, text, **kw: shown.append(text))
+    app.help_menu.invoke_label("Third-Party Notices")
+    assert shown == ["lxml license"]
+
+
+@pytest.mark.parametrize("opened", [True, False])
+def test_contact_opens_the_issue_tracker_or_shows_its_address(app, monkeypatch, opened):
+    urls = []
+    monkeypatch.setattr(main.webbrowser, "open", lambda url: urls.append(url) or opened)
+    app.help_menu.invoke_label("Report a Problem or Contact...")
+    assert urls == [main.SUPPORT_URL]
+    if opened:
+        assert tkstub.dialogs.info == []
+    else:
+        (title, message), = tkstub.dialogs.info
+        assert main.SUPPORT_URL in message
+
+
+class _Prompt:
+    """Stands in for the license prompt: records each call, answers `answer`."""
+
+    def __init__(self, answer):
+        self.answer = answer
+        self.calls = []
+
+    def __call__(self, root, text):
+        self.calls.append(text)
+        return self.answer
+
+
+def test_first_launch_asks_for_the_license_and_remembers_acceptance(tmp_path):
+    settings_path = str(tmp_path / "settings.json")
+    root = main.tk.Tk()
+    prompt = _Prompt(True)
+
+    assert main.ensure_license_accepted(root, settings_path, prompt) is True
+    assert prompt.calls == [main.legal.license_text()]
+
+    # Second launch: same terms, not asked again.
+    assert main.ensure_license_accepted(root, settings_path, prompt) is True
+    assert len(prompt.calls) == 1
+
+
+def test_declining_the_license_stops_the_launch_and_records_nothing(tmp_path):
+    settings_path = str(tmp_path / "settings.json")
+    prompt = _Prompt(False)
+    assert main.ensure_license_accepted(main.tk.Tk(), settings_path, prompt) is False
+    assert not os.path.exists(main.app_settings.license_acceptance_path(settings_path))
+    # Asked again on the next launch.
+    assert main.ensure_license_accepted(main.tk.Tk(), settings_path, prompt) is False
+    assert len(prompt.calls) == 2
+
+
+def test_revised_terms_are_asked_again(tmp_path, monkeypatch):
+    settings_path = str(tmp_path / "settings.json")
+    prompt = _Prompt(True)
+    main.ensure_license_accepted(main.tk.Tk(), settings_path, prompt)
+    monkeypatch.setattr(main.legal, "license_text", lambda: "Revised terms.")
+    main.ensure_license_accepted(main.tk.Tk(), settings_path, prompt)
+    assert prompt.calls[-1] == "Revised terms."
+    assert len(prompt.calls) == 2
+
+
+def test_saving_settings_keeps_the_acceptance(app, tmp_path):
+    """Settings are rewritten on every close; acceptance must survive that."""
+    prompt = _Prompt(True)
+    main.ensure_license_accepted(app.root, app.settings_path, prompt)
+    app._on_close()
+    main.ensure_license_accepted(main.tk.Tk(), app.settings_path, prompt)
+    assert len(prompt.calls) == 1
+
+
+def test_a_missing_license_refuses_to_start(tmp_path, monkeypatch):
+    def missing():
+        raise FileNotFoundError("LICENSE.txt not found")
+    monkeypatch.setattr(main.legal, "license_text", missing)
+    tkstub.dialogs.reset()
+    prompt = _Prompt(True)
+    assert main.ensure_license_accepted(
+        main.tk.Tk(), str(tmp_path / "settings.json"), prompt) is False
+    assert prompt.calls == []
+    (title, message), = tkstub.dialogs.errors
+    assert main.RELEASES_URL in message
+
+
+def test_an_unrecordable_acceptance_still_lets_the_program_run(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("read-only profile")
+    monkeypatch.setattr(main.app_settings, "save_license_acceptance", boom)
+    assert main.ensure_license_accepted(
+        main.tk.Tk(), str(tmp_path / "settings.json"), _Prompt(True)) is True
+
+
+def _answer_prompt(monkeypatch, root, accept):
+    """Make the user click I Accept (or close the window) when the prompt shows."""
+    created = []
+    original = main.TextWindow.__init__
+
+    def recording_init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        created.append(self)
+
+    monkeypatch.setattr(main.TextWindow, "__init__", recording_init)
+    root.on_wait_window = lambda top: (created[-1]._accept() if accept else top.destroy())
+    return created
+
+
+def test_license_prompt_hides_the_main_window_until_accepted(monkeypatch):
+    root = main.tk.Tk()
+    created = _answer_prompt(monkeypatch, root, accept=True)
+    assert main._prompt_license(root, "terms") is True
+    window, = created
+    assert window.text.content == "terms"
+    assert window.top.destroyed is True
+    assert root.withdrawn is False
+
+
+def test_closing_the_license_prompt_declines(monkeypatch):
+    root = main.tk.Tk()
+    _answer_prompt(monkeypatch, root, accept=False)
+    assert main._prompt_license(root, "terms") is False
+    assert root.withdrawn is True

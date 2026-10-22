@@ -57,6 +57,20 @@ Neither executable is code-signed, so Windows SmartScreen will show a
 "Windows protected your PC" warning the first time. Choose **More info** →
 **Run anyway**.
 
+Both are covered by the [End User License Agreement](#license), which permits
+personal use and use for your organization's own work. The installer shows it
+before installing; the program itself also shows it on first launch and will
+not start until it is accepted. That first-launch prompt is how the terms reach
+someone who runs the portable exe, or who got the program from a silent
+install (`/SILENT` or `/VERYSILENT` skips every installer page, the license page
+included). Acceptance is recorded per Windows user in
+`%APPDATA%\DocxFindReplace\license-accepted.json`, and the prompt comes back
+only if the license text changes.
+
+**IT deployment.** The license permits deploying the unmodified installer or
+portable exe to your organization's machines, silently if you like. Each user
+is asked to accept the license on their first launch.
+
 ### From source
 
 ```bash
@@ -92,6 +106,8 @@ python main.py
 
 The folder, rule set and options are saved when the window closes and restored when it opens, in `%APPDATA%\DocxFindReplace\settings.json`. Delete that file to start clean.
 
+The **Help** menu has the License Agreement, the Third-Party Notices (the licenses of the open-source components the program includes), **Report a Problem or Contact...** (opens the project's [issue tracker](https://github.com/Abe-Borg/docx-find-and-replace/issues)), and **About**, which shows the version, copyright and contact address.
+
 ### Rule-set files
 
 A rule set is a CSV with a `find,replace` header and one rule per row:
@@ -125,17 +141,19 @@ Each apply with the change log enabled writes `DocxFindReplace-changelog-<timest
 docx-find-and-replace/
 ├── main.py                 # GUI application (tkinter)
 ├── document_processor.py   # Core scan and replace logic, change log, backups
-├── settings.py             # Rule-set CSV files and remembered settings
-├── version.py              # Version and product name, used by app and installer
+├── settings.py             # Rule-set CSV files, remembered settings, license acceptance
+├── legal.py                # Finds and reads the bundled license and notices
+├── version.py              # Version, product name, copyright and URLs
 ├── requirements.txt        # Runtime dependencies
 ├── requirements-dev.txt    # Test and packaging dependencies
 ├── pytest.ini              # Test configuration
-├── LICENSE.txt             # Shown by the installer
+├── LICENSE.txt             # End User License Agreement (installer, first launch, Help)
 ├── packaging/
 │   ├── app.spec            # PyInstaller: one-folder build (wrapped by installer)
 │   ├── app-portable.spec   # PyInstaller: single-file portable build
 │   ├── installer.iss       # Inno Setup installer script
 │   ├── make_version_file.py# Windows file-version resource, from version.py
+│   ├── make_notices.py     # THIRD-PARTY-NOTICES.txt, from installed package metadata
 │   ├── build.bat           # One-command Windows build
 │   └── icon.ico            # Application icon
 ├── .github/workflows/
@@ -152,9 +170,10 @@ docx-find-and-replace/
 │   ├── test_fields.py      # Field codes, nested fields, fields across paragraphs
 │   ├── test_sections.py    # Heading path detection
 │   ├── test_changelog.py   # Change log CSV, backup discovery and restore
-│   ├── test_settings.py    # Rule-set files and the settings file
+│   ├── test_settings.py    # Rule-set files, the settings file, license acceptance
 │   ├── test_coverage.py    # Notes parts, staleness guard, progress and cancel
-│   ├── test_gui.py         # GUI behaviour against the tkinter stub
+│   ├── test_gui.py         # GUI behaviour against the tkinter stub, Help menu, license prompt
+│   ├── test_packaging.py   # Release-tag guard, notices, attribution kept in step
 │   └── tkstub.py           # Headless tkinter stand-in used by test_gui.py
 └── README.md               # This file
 ```
@@ -302,6 +321,17 @@ then produces:
 | `dist\DocxFindReplace-Portable.exe` | Single-file portable build |
 | `dist\installer\DocxFindReplace-Setup-<version>.exe` | The installer |
 
+Before building, it writes `packaging\THIRD-PARTY-NOTICES.txt` with
+`packaging\make_notices.py`: the license text of everything the build carries,
+taken from the installed packages' own metadata. That is the Python runtime
+(whose Windows license file also covers OpenSSL, Tcl/Tk and the other libraries
+it links), every package `requirements.txt` pulls in (python-docx, lxml and
+their dependencies; lxml's license covers the libxml2, libxslt, zlib and iconv
+it links), and PyInstaller's bootloader. A component whose license cannot be
+found stops the build. Both executables bundle the notices and `LICENSE.txt`,
+the installer also installs them beside the exe, and the release publishes them
+beside the portable exe.
+
 The installer step needs [Inno Setup 6](https://jrsoftware.org/isdl.php). If it
 is missing, the executables are still built and only the setup step is skipped.
 
@@ -309,7 +339,9 @@ The same build runs in GitHub Actions on every push and pull request, and
 attaches the installer and portable exe to the GitHub release when a `v*` tag is
 pushed. Version numbers come from `version.py` — bump it there and the
 executable's file properties, the installer, and the output filenames all
-follow.
+follow. The publisher, copyright line and project URLs live there too;
+`LICENSE.txt` and `installer.iss` repeat them, and the test suite fails if they
+drift apart.
 
 ### Verifying a build
 
@@ -318,8 +350,8 @@ templates left out of the bundle, or lxml's dynamically resolved imports not
 collected. Neither shows up until the document code actually runs.
 
 Both executables therefore support a headless self-check that performs a real
-find-and-replace on a temporary document and exits non-zero if anything is
-wrong:
+find-and-replace on a temporary document, checks that the license and the
+third-party notices were bundled, and exits non-zero if anything is wrong:
 
 ```bat
 DocxFindReplace.exe --selftest report.txt
@@ -344,12 +376,16 @@ CI runs this against both built executables before the installer is packaged.
 - **Preview can go stale** — If a document is edited in Word between clicking Preview and clicking Apply, the file is refused outright rather than edited with offsets that no longer describe it. The completion dialog names the file and reports the skipped changes; re-run the preview to pick up the new content. Detection is by file size and modification time, so an edit that changes neither would go unnoticed.
 - **Single-pass matching** — Replacement text is not re-scanned, so replacing "2022" with "2022 and 2025" applies exactly once per original occurrence
 
-## Copyright Notice
+## License
 
 **Copyright © 2025 Abraham Borg. All Rights Reserved.**
 
-This software and associated documentation files (the "Software") are the proprietary property of Abraham Borg. 
+This is proprietary software, distributed under the End User License Agreement in [`LICENSE.txt`](LICENSE.txt). In short — the agreement itself governs:
 
-**Unauthorized copying, modification, distribution, or use of this Software, via any medium, is strictly prohibited without express written permission from the copyright holder.**
+- **You may** install and use the official releases, free of charge, on any number of computers you own or control, for personal use or for your organization's own work, commercial projects included. You may run the unmodified source code instead of the executable for the same purposes. Your organization's IT staff may deploy the official installer or portable exe to its own machines.
+- **You may not** redistribute the program or its source outside your organization (point people to the [Releases](https://github.com/Abe-Borg/docx-find-and-replace/releases) page instead), modify it or distribute a modified version, or copy its source into other software.
+- **No warranty.** The program edits documents in place. Review the preview, keep backups, and check the results before relying on them.
 
-This Software is provided for review and reference purposes only. No license or right to use, copy, modify, or distribute this Software for any purpose, commercial or non-commercial, is granted.
+The open-source components the program includes (the Python runtime, python-docx, lxml and others) remain under their own licenses, collected in `THIRD-PARTY-NOTICES.txt` and shown under **Help > Third-Party Notices**. The agreement does not restrict the rights those licenses give you in those components.
+
+Questions, problem reports and requests for permissions the agreement does not grant: [open an issue](https://github.com/Abe-Borg/docx-find-and-replace/issues).

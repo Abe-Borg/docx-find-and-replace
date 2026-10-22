@@ -17,13 +17,19 @@ worse than a loud failure.
 - `document_processor.py` — all document logic: traversal, scan, in-place and
   tracked-changes apply, change log, backup discovery and restore. No tkinter
   imports; it is independently testable and that is deliberate.
-- `settings.py` — rule-set CSV files and the remembered-settings JSON. Stdlib
-  plus `Rule` only; also no tkinter.
+- `settings.py` — rule-set CSV files, the remembered-settings JSON and the
+  license-acceptance record. Stdlib plus `Rule` only; also no tkinter.
+- `legal.py` — finds and reads the bundled `LICENSE.txt` and
+  `THIRD-PARTY-NOTICES.txt` (from the PyInstaller bundle when frozen, the
+  repository otherwise). No tkinter.
 - `tests/` — pytest suite that builds real `.docx` fixtures on disk, plus
   `tkstub.py`, a headless tkinter stand-in that lets `test_gui.py` exercise the
   window's decisions without a display.
 - `version.py` — the one place the version lives. The GUI title, the Windows
   file-version resource, the installer and the output filenames all read it.
+  It also holds the publisher, copyright line and project URLs, which
+  `LICENSE.txt` and `installer.iss` repeat; `test_packaging.py` keeps them in
+  step.
 - `packaging/` — PyInstaller specs, the Inno Setup script and `build.bat`.
 - `.github/workflows/build.yml` — runs the suite against both ends of the
   supported python-docx range, then packages.
@@ -163,6 +169,26 @@ and stays that way, because tests and the selftest unpack it as a 4-tuple.
     Anything new that reads paragraph text for a scan or an apply gets the
     paragraph from `_locate_paragraphs`, never from `_collect_paragraphs`,
     which drops `open_fields`.
+
+## The license gate
+
+`LICENSE.txt` is an end-user license agreement, and `main()` will not open the
+window until `ensure_license_accepted` has it accepted. The installer's license
+page is not enough on its own: `/SILENT` and `/VERYSILENT` skip every wizard
+page, and the portable exe has no installer. The gate is in `main()`, not in
+`FindReplaceApp`, so tests and the selftest construct the window without it.
+
+- Acceptance is the SHA-256 of the license text, stored in its own
+  `license-accepted.json` beside the settings file. Not in `settings.json`:
+  `save_settings` writes only the keys in `DEFAULTS` and runs on every close,
+  so a key it does not know would be dropped. Any edit to `LICENSE.txt`,
+  whitespace included, asks every user again. That is intended.
+- A license that cannot be read stops the launch with an error. The selftest
+  checks the bundle carries it, so that is a packaging failure CI catches.
+- An acceptance that cannot be recorded does not stop the launch; the user is
+  asked again next time.
+- Do not change the license *terms* on your own initiative. They are the
+  copyright holder's decision; flag a problem instead.
 
 ## Traversal specifics
 
@@ -313,6 +339,10 @@ accepting gives the in-place result and rejecting gives the original. A test
 that only checks `paragraph_text` after a tracked edit proves little, because
 the traversal hides deletions by design.
 
+The license gate is tested through `ensure_license_accepted(root, settings_path,
+prompt)` with a fake prompt; `FakeRoot.on_wait_window` stands in for the user
+answering the real one.
+
 For GUI work, `tests/test_gui.py` installs `tkstub` **before** importing `main`,
 so the stub must be in place first. The stub is deliberately minimal: a widget
 method `main.py` starts calling that the stub lacks fails loudly with
@@ -355,11 +385,21 @@ specs exist for that reason. Removing either produces a build that starts fine
 and then fails the moment a document is opened.
 
 `main.py --selftest [report]` is the guard: it runs a real find-and-replace on a
-temporary document, imports tkinter, writes a report and exits non-zero on
-failure. The workflow runs it against **both built executables** before
+temporary document, checks the license and third-party notices were bundled,
+imports tkinter, writes a report and exits non-zero on failure. The workflow runs it against **both built executables** before
 packaging. A windowed executable has no console, hence the report file. If you
 change what the packaged build depends on, extend the selftest to cover it —
 otherwise CI will keep passing while the shipped exe is broken.
+
+Both specs also bundle `LICENSE.txt` and `packaging/THIRD-PARTY-NOTICES.txt` as
+data. The notices are generated before PyInstaller runs, by
+`packaging/make_notices.py` (in `build.bat` and the workflow), from the
+installed packages' own metadata: the Python runtime's license (on Windows it
+also covers OpenSSL, Tcl/Tk and the other libraries it links), every
+distribution `requirements.txt` pulls in, and the PyInstaller bootloader. It
+fails rather than leave a component out. A new runtime dependency needs no
+edit there, but a new *build tool* whose code ends up in the exe goes in
+`BUILD_TOOLS`. The file is gitignored like `file_version_info.txt`.
 
 Other things worth not relearning:
 

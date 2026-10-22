@@ -12,6 +12,9 @@
 #define AppId        "DocxFindReplace"
 #define AppExeName   "DocxFindReplace.exe"
 #define AppPublisher "Abraham Borg"
+#define AppCopyright "Copyright (C) 2025 Abraham Borg. All Rights Reserved."
+#define AppURL       "https://github.com/Abe-Borg/docx-find-and-replace"
+#define SupportURL   AppURL + "/issues"
 
 ; Passed in by the build script; the fallback keeps a bare ISCC run working.
 #ifndef AppVersion
@@ -26,7 +29,14 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
+AppCopyright={#AppCopyright}
+; Shown in Settings > Apps, so a user or IT has somewhere to ask.
+AppPublisherURL={#AppURL}
+AppSupportURL={#SupportURL}
+AppUpdatesURL={#AppURL}/releases
+AppContact={#SupportURL}
 VersionInfoVersion={#AppVersion}
+VersionInfoCopyright={#AppCopyright}
 
 DefaultDirName={autopf}\{#AppId}
 DefaultGroupName={#AppName}
@@ -48,6 +58,9 @@ UninstallDisplayName={#AppName}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+; The interactive wizard shows the license here. /SILENT and /VERYSILENT skip
+; every wizard page, this one included, so the application itself asks for
+; acceptance on first launch; that is what covers silent and portable use.
 LicenseFile=..\LICENSE.txt
 
 [Languages]
@@ -58,6 +71,9 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 
 [Files]
 Source: "..\dist\{#AppId}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Also bundled inside the app; installed beside the exe so they can be found.
+Source: "..\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"

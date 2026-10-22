@@ -21,6 +21,8 @@ sys.path.insert(0, ROOT)
 from version import APP_ID                # noqa: E402
 
 datas = collect_data_files("docx")
+datas += [(os.path.join(ROOT, "LICENSE.txt"), "."),
+          (os.path.join(SPECPATH, "THIRD-PARTY-NOTICES.txt"), ".")]
 
 a = Analysis(
     [os.path.join(ROOT, "main.py")],

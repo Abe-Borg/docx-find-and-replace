@@ -74,6 +74,11 @@ jobs:
       - name: Generate Windows version resource
         run: python packaging/make_version_file.py
 
+      # The license of everything the build bundles, from the installed
+      # packages' metadata. Fails if one cannot be found.
+      - name: Generate third-party notices
+        run: python packaging/make_notices.py
+
       - name: Build installed (one-folder) app
         run: python -m PyInstaller packaging/app.spec --noconfirm --clean
 
@@ -123,6 +128,12 @@ jobs:
           & $iscc "/DAppVersion=${{ steps.v.outputs.value }}" packaging\installer.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed ($LASTEXITCODE)" }
 
+      # The portable exe is published on its own, so the terms go beside it.
+      - name: Stage the license and notices
+        run: |
+          Copy-Item LICENSE.txt dist\LICENSE.txt
+          Copy-Item packaging\THIRD-PARTY-NOTICES.txt dist\THIRD-PARTY-NOTICES.txt
+
       - name: List what was built
         run: |
           Get-ChildItem dist\installer, dist\*.exe |
@@ -136,6 +147,8 @@ jobs:
           path: |
             dist/installer/*.exe
             dist/DocxFindReplace-Portable.exe
+            dist/LICENSE.txt
+            dist/THIRD-PARTY-NOTICES.txt
           if-no-files-found: error
 
       - name: Attach to the release
@@ -150,4 +163,6 @@ jobs:
           }
           $files = @((Get-ChildItem dist\installer\*.exe).FullName)
           $files += (Get-Item dist\DocxFindReplace-Portable.exe).FullName
+          $files += (Get-Item dist\LICENSE.txt).FullName
+          $files += (Get-Item dist\THIRD-PARTY-NOTICES.txt).FullName
           gh release upload $tag $files --clobber

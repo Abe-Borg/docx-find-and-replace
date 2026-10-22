@@ -16,7 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
-from version import APP_ID, APP_NAME, PUBLISHER, __version__  # noqa: E402
+from version import APP_ID, APP_NAME, COPYRIGHT, PUBLISHER, __version__  # noqa: E402
 
 parts = [int(p) for p in __version__.split(".")]
 while len(parts) < 4:
@@ -43,7 +43,7 @@ VSVersionInfo(
          StringStruct('FileDescription', '{app_name}'),
          StringStruct('FileVersion', '{version}'),
          StringStruct('InternalName', '{app_id}'),
-         StringStruct('LegalCopyright', 'Copyright (C) 2025 {publisher}. All Rights Reserved.'),
+         StringStruct('LegalCopyright', '{copyright}'),
          StringStruct('OriginalFilename', '{app_id}.exe'),
          StringStruct('ProductName', '{app_name}'),
          StringStruct('ProductVersion', '{version}')])
@@ -56,5 +56,6 @@ VSVersionInfo(
 out = os.path.join(HERE, "file_version_info.txt")
 with open(out, "w", encoding="utf-8") as fh:
     fh.write(TEMPLATE.format(vers=vers, version=__version__, app_name=APP_NAME,
-                             app_id=APP_ID, publisher=PUBLISHER))
+                             app_id=APP_ID, publisher=PUBLISHER,
+                             copyright=COPYRIGHT))
 print(f"wrote {out} for version {__version__}")
