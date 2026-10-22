@@ -18,15 +18,17 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from datetime import datetime
 from tkinter import ttk, filedialog, messagebox
 from typing import Dict, List, Optional
 
+import legal
 import settings as app_settings
 from document_processor import (Backup, FileResult, Match, Rule, apply_changes,
                                 find_backups, restore_backups, scan_documents_detailed,
                                 write_change_log, _normalise_rules)
-from version import APP_NAME, __version__
+from version import APP_NAME, COPYRIGHT, RELEASES_URL, SUPPORT_URL, __version__
 
 
 # Prefix shown before each match's location in the results tree.
@@ -126,6 +128,8 @@ class FindReplaceApp:
 
     def _build_ui(self):
         """Build the complete GUI layout."""
+        self._build_menu()
+
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -295,6 +299,64 @@ class FindReplaceApp:
         self.status_label = ttk.Label(bottom_frame, textvariable=self.progress_var,
                                       style="Status.TLabel")
         self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def _build_menu(self):
+        """Help menu: the terms the program is used under, and who to ask."""
+        menubar = tk.Menu(self.root)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="License Agreement", command=self._show_license)
+        help_menu.add_command(label="Third-Party Notices", command=self._show_notices)
+        help_menu.add_separator()
+        help_menu.add_command(label="Report a Problem or Contact...",
+                              command=self._open_support)
+        help_menu.add_separator()
+        help_menu.add_command(label=f"About {APP_NAME}", command=self._show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        self.root.configure(menu=menubar)
+        self.help_menu = help_menu
+
+    # ------------------------------------------------------------------
+    # Help
+    # ------------------------------------------------------------------
+
+    def _show_about(self):
+        messagebox.showinfo(
+            f"About {APP_NAME}",
+            f"{APP_NAME}\nVersion {__version__}\n\n{COPYRIGHT}\n\n"
+            "Licensed to you under the End User License Agreement "
+            "(Help > License Agreement). Includes open-source components, "
+            "listed under Help > Third-Party Notices.\n\n"
+            f"Problems, questions and permission requests:\n{SUPPORT_URL}\n\n"
+            f"Official downloads:\n{RELEASES_URL}")
+
+    def _show_license(self):
+        try:
+            text = legal.license_text()
+        except OSError as e:
+            messagebox.showerror("License Agreement", f"The license could not be read.\n\n{e}")
+            return
+        TextWindow(self.root, "License Agreement", text)
+
+    def _show_notices(self):
+        try:
+            text = legal.notices_text()
+        except OSError:
+            messagebox.showinfo(
+                "Third-Party Notices",
+                f"{legal.NOTICES_FILE} is generated when the application is "
+                "packaged, so a copy run from source has none. Run "
+                "packaging/make_notices.py to generate it.")
+            return
+        TextWindow(self.root, "Third-Party Notices", text)
+
+    def _open_support(self):
+        try:
+            opened = webbrowser.open(SUPPORT_URL)
+        except Exception:
+            opened = False
+        if not opened:
+            messagebox.showinfo("Report a Problem or Contact",
+                                f"Report problems and send questions at:\n\n{SUPPORT_URL}")
 
     # ------------------------------------------------------------------
     # Settings persistence
@@ -1186,6 +1248,101 @@ class RestoreDialog:
         self.app._after_restore(result)
 
 
+class TextWindow:
+    """
+    A read-only, scrolling text window: the license and the third-party
+    notices. With `accept=True` it is the first-run license prompt, and
+    `accepted` says whether the user chose I Accept; closing it any other way
+    declines.
+    """
+
+    def __init__(self, parent, title: str, text: str, accept: bool = False):
+        self.accepted = False
+
+        self.top = tk.Toplevel(parent)
+        self.top.title(title)
+        self.top.geometry("720x560")
+        self.top.minsize(480, 320)
+
+        frame = ttk.Frame(self.top, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+        if accept:
+            ttk.Label(frame, wraplength=680, text=(
+                f"Please read the license agreement. You must accept it to use "
+                f"{APP_NAME}.")).pack(fill=tk.X, pady=(0, 6))
+
+        text_frame = ttk.Frame(frame)
+        text_frame.pack(fill=tk.BOTH, expand=True)
+        self.text = tk.Text(text_frame, wrap="word", font=("Consolas", 9))
+        scroll = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        self.text.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(0, weight=1)
+        self.text.insert("1.0", text)
+        self.text.configure(state=tk.DISABLED)
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill=tk.X, pady=(8, 0))
+        if accept:
+            ttk.Button(buttons, text="I Accept", command=self._accept).pack(side=tk.RIGHT)
+            ttk.Button(buttons, text="Decline", command=self.top.destroy).pack(
+                side=tk.RIGHT, padx=(0, 6))
+        else:
+            ttk.Button(buttons, text="Close", command=self.top.destroy).pack(side=tk.RIGHT)
+        self.top.protocol("WM_DELETE_WINDOW", self.top.destroy)
+
+    def _accept(self):
+        self.accepted = True
+        self.top.destroy()
+
+
+def _prompt_license(root, text: str) -> bool:
+    """Show the license with the main window hidden; True if accepted."""
+    root.withdraw()
+    window = TextWindow(root, f"{APP_NAME} - License Agreement", text, accept=True)
+    window.top.lift()
+    window.top.grab_set()
+    root.wait_window(window.top)
+    if window.accepted:
+        root.deiconify()
+    return window.accepted
+
+
+def ensure_license_accepted(root, settings_path: Optional[str] = None,
+                            prompt=None) -> bool:
+    """
+    Ask for acceptance of the license unless this user already accepted this
+    exact text.
+
+    The installer's license page is skipped by a silent install, and the
+    portable exe has no installer at all, so this is the one gate every way of
+    running the program passes through. Revised terms change the digest and
+    are asked again. If the acceptance cannot be recorded the program still
+    runs; the user is simply asked again next time.
+    """
+    try:
+        text = legal.license_text()
+    except OSError as e:
+        messagebox.showerror(
+            "License Missing",
+            f"The license agreement could not be read, so {APP_NAME} cannot "
+            f"start.\n\n{e}\n\nReinstall it from {RELEASES_URL}")
+        return False
+    digest = legal.license_digest(text)
+    path = app_settings.license_acceptance_path(settings_path)
+    if app_settings.load_license_acceptance(path) == digest:
+        return True
+    if not (prompt or _prompt_license)(root, text):
+        return False
+    try:
+        app_settings.save_license_acceptance(digest, path)
+    except OSError:
+        pass
+    return True
+
+
 def selftest(report_path: Optional[str] = None) -> int:
     """
     Prove a packaged build works end to end, without opening a window.
@@ -1197,8 +1354,9 @@ def selftest(report_path: Optional[str] = None) -> int:
     real executable so a broken bundle cannot be shipped.
 
     Covers the in-place engine, the tracked-changes engine, a rule-set CSV
-    round trip and the settings file, because each is a separate path the
-    frozen build has to carry.
+    round trip, the settings file, and the license and third-party notices
+    bundled as data, because each is a separate path the frozen build has to
+    carry. Without the license the program refuses to start.
 
     Writes a report to `report_path` when given, because a windowed executable
     has no console to print to.
@@ -1272,6 +1430,24 @@ def selftest(report_path: Optional[str] = None) -> int:
                 raise AssertionError("settings did not round-trip")
             lines.append("rule set and settings OK")
 
+        # Bundled data files. The notices are generated at build time, so a
+        # source checkout may not have them; a frozen build must.
+        if COPYRIGHT not in legal.license_text():
+            raise AssertionError("LICENSE.txt does not carry the copyright line")
+        lines.append(f"license OK -> {legal.resource_path(legal.LICENSE_FILE)}")
+        try:
+            notices = legal.notices_text()
+        except OSError:
+            if getattr(sys, "frozen", False):
+                raise
+            lines.append("third-party notices not generated (source run)")
+        else:
+            for name in ("Python", "python-docx", "lxml"):
+                if name not in notices:
+                    raise AssertionError(f"third-party notices do not cover {name}")
+            lines.append(f"third-party notices OK -> "
+                         f"{legal.resource_path(legal.NOTICES_FILE)}")
+
         lines.append(f"tkinter OK -> Tk {tk.TkVersion}")
         lines.append("SELFTEST PASSED")
     except Exception:
@@ -1315,6 +1491,10 @@ def main():
             root.tk.call("tk", "scaling", scaling)
         except Exception:
             pass
+
+    if not ensure_license_accepted(root):
+        root.destroy()
+        return
 
     FindReplaceApp(root)
     root.mainloop()

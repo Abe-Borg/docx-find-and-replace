@@ -16,18 +16,25 @@ Two plain-file formats, both deliberately simple enough to edit by hand:
   the wrong type is dropped, so an old or edited file can never crash the
   start-up.
 
+* **License acceptance** is a separate small JSON file beside the settings,
+  recording the digest of the license text the user accepted. It is kept apart
+  so that saving settings, which writes only the keys in ``DEFAULTS``, can
+  never drop it.
+
 No tkinter here: this module is imported by the GUI and tested headlessly.
 """
 
 import csv
 import json
 import os
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
 from document_processor import Rule
 
 APP_DIR_NAME = "DocxFindReplace"
 SETTINGS_FILE_NAME = "settings.json"
+LICENSE_ACCEPTANCE_FILE_NAME = "license-accepted.json"
 
 RULES_HEADER = ("find", "replace")
 
@@ -146,6 +153,23 @@ def load_settings(path: Optional[str] = None) -> Dict[str, Any]:
     return settings
 
 
+def _write_json_atomically(data: Any, path: str) -> None:
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = os.path.join(directory, f".{os.path.basename(path)}.{os.getpid()}.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+
+
 def save_settings(settings: Dict[str, Any], path: Optional[str] = None) -> str:
     """
     Write settings, creating the folder if needed. Returns the path written.
@@ -168,18 +192,35 @@ def save_settings(settings: Dict[str, Any], path: Optional[str] = None) -> str:
             ]
         data[key] = value
 
-    directory = os.path.dirname(os.path.abspath(path))
-    os.makedirs(directory, exist_ok=True)
-    tmp_path = os.path.join(directory, f".{os.path.basename(path)}.{os.getpid()}.tmp")
+    _write_json_atomically(data, path)
+    return path
+
+
+# --------------------------------------------------------------------------
+# License acceptance (JSON)
+# --------------------------------------------------------------------------
+
+def license_acceptance_path(settings_path: Optional[str] = None) -> str:
+    """The acceptance record, in the same folder as the settings file."""
+    settings_path = settings_path or default_settings_path()
+    return os.path.join(os.path.dirname(os.path.abspath(settings_path)),
+                        LICENSE_ACCEPTANCE_FILE_NAME)
+
+
+def load_license_acceptance(path: str) -> str:
+    """The digest of the license text last accepted, or "" if none."""
     try:
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, path)
-    except Exception:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-        raise
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    digest = data.get("license_sha256") if isinstance(data, dict) else None
+    return digest if isinstance(digest, str) else ""
+
+
+def save_license_acceptance(digest: str, path: str) -> str:
+    """Record that the license text with `digest` was accepted. Returns `path`."""
+    _write_json_atomically({"license_sha256": digest,
+                            "accepted_at": datetime.now().isoformat(timespec="seconds")},
+                           path)
     return path

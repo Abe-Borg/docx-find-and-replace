@@ -232,12 +232,58 @@ class FakeTreeview(_Widget):
         return self._items[iid]["tags"]
 
 
+class FakeMenu(_Widget):
+    """Records its entries so a test can find a command by label and run it."""
+
+    def __init__(self, master=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self.entries = []          # (kind, label, command-or-submenu)
+
+    def add_command(self, label="", command=None, **kwargs):
+        self.entries.append(("command", label, command))
+
+    def add_cascade(self, label="", menu=None, **kwargs):
+        self.entries.append(("cascade", label, menu))
+
+    def add_separator(self, **kwargs):
+        self.entries.append(("separator", "", None))
+
+    def labels(self):
+        return [label for kind, label, _ in self.entries if kind != "separator"]
+
+    def invoke_label(self, label):
+        for kind, entry_label, command in self.entries:
+            if kind == "command" and entry_label == label:
+                return command()
+        raise KeyError(label)
+
+
+class FakeText(_Widget):
+    """Holds its text, and refuses an insert once configured read-only."""
+
+    def __init__(self, master=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self.content = ""
+
+    def insert(self, index, text, *tags):
+        if self.options.get("state") == "disabled":
+            return
+        self.content += text
+
+    def yview(self, *args):
+        pass
+
+
 class FakeRoot(_Widget):
     def __init__(self, *args, **kwargs):
         super().__init__(None, **kwargs)
         self.destroyed = False
+        self.withdrawn = False
         self.protocols = {}
         self.tk = _TkCall()
+        # What wait_window does to the window being waited on, standing in for
+        # the user's click: called with that window, before wait_window returns.
+        self.on_wait_window = None
 
     def title(self, *a):
         pass
@@ -258,6 +304,16 @@ class FakeRoot(_Widget):
 
     def mainloop(self):
         pass
+
+    def withdraw(self):
+        self.withdrawn = True
+
+    def deiconify(self):
+        self.withdrawn = False
+
+    def wait_window(self, window=None):
+        if self.on_wait_window is not None:
+            self.on_wait_window(window)
 
     def destroy(self):
         self.destroyed = True
@@ -354,6 +410,8 @@ def install():
     tk.Tk = FakeRoot
     tk.Toplevel = FakeToplevel
     tk.Frame = _Widget
+    tk.Menu = FakeMenu
+    tk.Text = FakeText
     # main.selftest() reports these; a frozen build that shipped without Tcl/Tk
     # would fail on them, which is the point of checking.
     tk.TkVersion = 8.6

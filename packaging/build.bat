@@ -35,6 +35,11 @@ python packaging\make_version_file.py
 if errorlevel 1 exit /b 1
 
 echo.
+echo === Generating third-party notices ===
+python packaging\make_notices.py
+if errorlevel 1 exit /b 1
+
+echo.
 echo === Building installed (one-folder) build ===
 python -m PyInstaller packaging\app.spec --noconfirm --clean
 if errorlevel 1 exit /b 1

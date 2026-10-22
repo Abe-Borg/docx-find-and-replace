@@ -146,3 +146,33 @@ def test_save_overwrites_atomically(tmp_path):
     settings.save_settings({"author": "second"}, path)
     assert settings.load_settings(path)["author"] == "second"
     assert sorted(os.listdir(str(tmp_path))) == ["settings.json"]
+
+
+# ---------------------------------------------------------------- license acceptance
+
+def test_acceptance_lives_beside_the_settings_file(tmp_path):
+    path = settings.license_acceptance_path(str(tmp_path / "sub" / "settings.json"))
+    assert path == os.path.join(str(tmp_path / "sub"), settings.LICENSE_ACCEPTANCE_FILE_NAME)
+
+
+def test_acceptance_round_trips(tmp_path):
+    path = str(tmp_path / "new" / "license-accepted.json")
+    assert settings.load_license_acceptance(path) == ""
+    settings.save_license_acceptance("abc123", path)
+    assert settings.load_license_acceptance(path) == "abc123"
+    with open(path, encoding="utf-8") as fh:
+        assert "accepted_at" in json.load(fh)
+
+
+@pytest.mark.parametrize("content", ["{oops", "[]", '{"license_sha256": 5}'])
+def test_unreadable_acceptance_counts_as_not_accepted(tmp_path, content):
+    path = _write(tmp_path / "license-accepted.json", content)
+    assert settings.load_license_acceptance(path) == ""
+
+
+def test_saving_settings_does_not_touch_the_acceptance(tmp_path):
+    settings_path = str(tmp_path / "settings.json")
+    acceptance = settings.license_acceptance_path(settings_path)
+    settings.save_license_acceptance("abc123", acceptance)
+    settings.save_settings(dict(settings.DEFAULTS), settings_path)
+    assert settings.load_license_acceptance(acceptance) == "abc123"
