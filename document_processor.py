@@ -5,8 +5,8 @@ Core find-and-replace logic for Word documents (.docx).
 Design note — one traversal, one source of truth
 ------------------------------------------------
 Paragraph text, character offsets, and the XML nodes that hold the text are all
-produced by a single walk of the document XML (`_paragraph_text_and_nodes`).
-They are therefore structurally aligned and cannot drift apart.
+produced by a single walk of the document XML (`_walk_paragraph`). They are
+therefore structurally aligned and cannot drift apart.
 
 This matters because python-docx's convenience APIs disagree with each other:
 `Paragraph.text` is built from ``w:r | w:hyperlink`` while `Paragraph.runs`
@@ -30,6 +30,12 @@ straight across one. The traversal therefore records each of them as an opaque,
 zero-length position, and an edit with one strictly inside its range is skipped
 with a reason: writing the replacement would move the picture, or put the new
 text half inside a field result.
+
+A complex field's code - everything from its begin to its separate, including
+the cached result of a field nested in the code - is not on the page, so it is
+not part of the text either. The walk follows the open fields through each
+story, from paragraph to paragraph, because a field may begin in one paragraph
+and end in a later one.
 
 Covered content: body paragraphs, tables (including nested tables), text boxes,
 headers and footers, footnotes, endnotes and comments. Text inside hyperlinks,
@@ -246,34 +252,79 @@ class _TextNode:
 
     An opaque node owns no characters. It marks where an element that is not
     text sits (a picture, a note reference mark, a field character), so that
-    an edit can tell it would cross one.
+    an edit can tell it would cross one. Everything inside a field's code is
+    opaque too, text included: Word does not show it.
     """
     element: object
     start: int
     length: int
     editable: bool      # True for w:t; False for atomic leaves (w:tab, w:br, ...)
     opaque: bool = False  # True for a zero-length position of a non-text element
+    in_code: bool = False  # True when the walk reached it inside a field's code
 
 
 # --------------------------------------------------------------------------
 # Single-pass paragraph text extraction
 # --------------------------------------------------------------------------
 
-def _paragraph_text_and_nodes(p_el) -> Tuple[str, List[_TextNode]]:
-    """
-    Walk a ``w:p`` element and return (full_text, nodes).
+_FLD_CHAR = _w('fldChar')
+_FLD_CHAR_TYPE = _w('fldCharType')
 
-    ``nodes`` maps character ranges of ``full_text`` onto the XML elements that
+
+class _ParagraphWalk(NamedTuple):
+    """The full result of walking one paragraph."""
+    text: str
+    nodes: List[_TextNode]
+    open_fields: Tuple[bool, ...]   # the fields still open where it ends
+
+
+def _step_fields(fields: List[bool], fld_char_type: Optional[str]) -> None:
+    """
+    Advance the open-field stack past one ``w:fldChar``. A field is True from
+    its begin to its separate (its code) and False from there to its end (its
+    result). A separate or end with no open field to close is ignored.
+    """
+    if fld_char_type == 'begin':
+        fields.append(True)
+    elif fld_char_type == 'separate':
+        if fields:
+            fields[-1] = False
+    elif fld_char_type == 'end':
+        if fields:
+            fields.pop()
+
+
+def _walk_paragraph(p_el, open_fields: Tuple[bool, ...] = ()) -> _ParagraphWalk:
+    """
+    Walk a ``w:p`` element once: its text, the nodes that hold it, and the
+    complex fields still open where it ends.
+
+    ``nodes`` maps character ranges of the text onto the XML elements that
     produced them, built in the same pass as the text itself. Every element
     that is neither text, an atomic leaf, an inline container nor a neutral
     marker is recorded as an opaque node of length zero at the offset where it
     sits. It adds nothing to the text, so offsets and context are what the
     reader sees, but an edit whose range has one strictly inside it is refused
     (`_apply_edits`).
+
+    A complex field's code runs from its begin to its separate, and Word shows
+    none of it: not the ``w:instrText``, and not the cached result of a field
+    nested inside the code, which is an ordinary ``w:t``. The walk keeps a
+    stack of the fields open at each point, one flag per field, True while it
+    is in its code. While any open field is in its code, everything reached is
+    an opaque node marked `in_code` and adds nothing to the text. A field
+    nested in another's result is text like any other result.
+
+    `open_fields` is the stack the paragraph begins with, outermost first: a
+    field can begin in one paragraph and end in a later one (a table of
+    contents does). `_walk_container` carries the returned `open_fields` on to
+    the next paragraph of the same story. The default, no open field, is
+    right only for a paragraph whose story has no field open before it.
     """
     parts: List[str] = []
     nodes: List[_TextNode] = []
     pos = 0
+    fields = list(open_fields)
 
     def visit(el):
         nonlocal pos
@@ -281,7 +332,18 @@ def _paragraph_text_and_nodes(p_el) -> Tuple[str, List[_TextNode]]:
             tag = child.tag
             if not isinstance(tag, str):
                 continue        # an XML comment or processing instruction
-            if tag == _T:
+            if tag in _INLINE_CONTAINERS:
+                visit(child)
+                continue
+            if tag in _NEUTRAL_MARKERS:
+                continue
+            in_code = True in fields
+            if tag == _FLD_CHAR:
+                nodes.append(_TextNode(child, pos, 0, False, True, in_code))
+                _step_fields(fields, child.get(_FLD_CHAR_TYPE))
+            elif in_code:
+                nodes.append(_TextNode(child, pos, 0, False, True, True))
+            elif tag == _T:
                 text = child.text or ""
                 if text:
                     nodes.append(_TextNode(child, pos, len(text), True))
@@ -292,18 +354,29 @@ def _paragraph_text_and_nodes(p_el) -> Tuple[str, List[_TextNode]]:
                 nodes.append(_TextNode(child, pos, len(ch), False))
                 parts.append(ch)
                 pos += len(ch)
-            elif tag in _INLINE_CONTAINERS:
-                visit(child)
-            elif tag not in _NEUTRAL_MARKERS:
+            else:
                 nodes.append(_TextNode(child, pos, 0, False, True))
 
     visit(p_el)
-    return "".join(parts), nodes
+    return _ParagraphWalk("".join(parts), nodes, tuple(fields))
 
 
-def paragraph_text(p_el) -> str:
-    """Public helper: the text of a ``w:p`` element as this module sees it."""
-    return _paragraph_text_and_nodes(p_el)[0]
+def _paragraph_text_and_nodes(p_el, open_fields: Tuple[bool, ...] = ()
+                              ) -> Tuple[str, List[_TextNode]]:
+    """(text, nodes): the two-field view of `_walk_paragraph`."""
+    walk = _walk_paragraph(p_el, open_fields)
+    return walk.text, walk.nodes
+
+
+def paragraph_text(p_el, open_fields: Tuple[bool, ...] = ()) -> str:
+    """
+    Public helper: the text of a ``w:p`` element as this module sees it.
+
+    Pass the paragraph's `open_fields` from `_locate_paragraphs` when a field
+    may be open where it begins; without them it is read as starting outside
+    any field.
+    """
+    return _walk_paragraph(p_el, open_fields).text
 
 
 # --------------------------------------------------------------------------
@@ -432,11 +505,12 @@ class _HeadingTracker:
         self.levels = levels
         self.stack: List[Tuple[int, str]] = []
 
-    def observe(self, p_el) -> None:
+    def observe(self, p_el, text: str) -> None:
+        """Take note of a body paragraph whose text, as walked, is `text`."""
         level = _outline_level(p_el, self.levels)
         if level is None:
             return
-        label = " ".join(paragraph_text(p_el).split())
+        label = " ".join(text.split())
         if not label:
             return
         if len(label) > _HEADING_LABEL_MAX:
@@ -449,9 +523,43 @@ class _HeadingTracker:
         return " > ".join(text for _lvl, text in self.stack)
 
 
+class _OpenFields:
+    """
+    The complex fields open at the current point of one story, carried from
+    each paragraph to the next in document order (see `_walk_paragraph`).
+
+    A story is the body (its table cells included), one header or footer
+    part, one footnote, endnote or comment, or one text box. Word pairs field
+    characters across a whole story, so a table of contents that begins in
+    one paragraph and ends several later is one field. Nothing carries from
+    one story into another.
+    """
+
+    def __init__(self):
+        self.state: Tuple[bool, ...] = ()
+
+
+def _has_ancestor_in(el, elements, stop_el) -> bool:
+    """True if any ancestor of `el` below `stop_el` is one of `elements`."""
+    parent = el.getparent()
+    while parent is not None and parent is not stop_el:
+        if parent in elements:
+            return True
+        parent = parent.getparent()
+    return False
+
+
 def _walk_textboxes(p_el, loc_type: str, para_detail: str, out: List[tuple],
-                    headings: Optional[_HeadingTracker] = None) -> None:
-    """Collect paragraphs of any text box anchored in this paragraph."""
+                    headings: Optional[_HeadingTracker] = None,
+                    nodes: Sequence[_TextNode] = ()) -> None:
+    """
+    Collect paragraphs of any text box anchored in this paragraph.
+
+    `nodes` is the paragraph's walk. A text box whose drawing sits inside a
+    field's code is part of the instruction, not the page, and is skipped.
+    Each text box is a story of its own, so its walk starts with no field open.
+    """
+    in_code = {n.element for n in nodes if n.in_code}
     for txbx in p_el.iter(_TXBX_CONTENT):
         # Skip the legacy mc:Fallback copy of a text box; Word renders mc:Choice.
         if _has_intervening(txbx, {_FALLBACK}, p_el):
@@ -459,11 +567,14 @@ def _walk_textboxes(p_el, loc_type: str, para_detail: str, out: List[tuple],
         # A nested text box is reached through its own paragraph's walk.
         if _has_intervening(txbx, {_TXBX_CONTENT}, p_el):
             continue
+        if in_code and _has_ancestor_in(txbx, in_code, p_el):
+            continue
         _walk_container(txbx, loc_type, f"{para_detail}, Text Box", out, headings)
 
 
 def _walk_table(tbl_el, loc_type: str, prefix: str, table_no: int, out: List[tuple],
-                headings: Optional[_HeadingTracker] = None) -> None:
+                headings: Optional[_HeadingTracker] = None,
+                fields: Optional[_OpenFields] = None) -> None:
     """Walk a ``w:tbl``. Iterating XML visits each physical cell exactly once."""
     base = f"{prefix}, " if prefix else ""
     cell_type = 'table' if loc_type == 'body' else loc_type
@@ -478,19 +589,25 @@ def _walk_table(tbl_el, loc_type: str, prefix: str, table_no: int, out: List[tup
                 continue
             cell_no += 1
             cell_prefix = f"{base}Table {table_no}, Row {row_no}, Cell {cell_no}"
-            _walk_container(cell, cell_type, cell_prefix, out, headings)
+            _walk_container(cell, cell_type, cell_prefix, out, headings, fields)
 
 
 def _walk_container(el, loc_type: str, prefix: str, out: List[tuple],
-                    headings: Optional[_HeadingTracker] = None) -> None:
+                    headings: Optional[_HeadingTracker] = None,
+                    fields: Optional[_OpenFields] = None) -> None:
     """
     Walk a block-level container (``w:body``, ``w:hdr``, ``w:ftr``, ``w:tc``,
     ``w:txbxContent``) in document order, appending
-    ``(p_element, location_type, location_detail, section)`` tuples to `out`.
+    ``(p_element, location_type, location_detail, section, open_fields)``
+    tuples to `out`.
 
     `headings` tracks the heading path for the body part; flow-level body
     paragraphs (an empty prefix) update it, everything else only reads it.
+    `fields` follows the open complex fields through the story; a new story
+    starts with none. `open_fields` is the state each paragraph begins in.
     """
+    if fields is None:
+        fields = _OpenFields()
     multi_para = sum(1 for c in el if c.tag == _P) > 1
     para_no = 0
     table_no = 0
@@ -505,22 +622,25 @@ def _walk_container(el, loc_type: str, prefix: str, out: List[tuple],
                 detail = f"{prefix}, Para {para_no}"
             else:
                 detail = prefix
+            open_fields = fields.state
+            walk = _walk_paragraph(child, open_fields)
+            fields.state = walk.open_fields
             if headings is not None and loc_type == 'body' and not prefix:
-                headings.observe(child)
+                headings.observe(child, walk.text)
             section = headings.path if headings is not None else ""
-            out.append((child, loc_type, detail, section))
-            _walk_textboxes(child, loc_type, detail, out, headings)
+            out.append((child, loc_type, detail, section, open_fields))
+            _walk_textboxes(child, loc_type, detail, out, headings, walk.nodes)
         elif tag == _TBL:
             table_no += 1
-            _walk_table(child, loc_type, prefix, table_no, out, headings)
+            _walk_table(child, loc_type, prefix, table_no, out, headings, fields)
         elif tag == _SDT:
             content = child.find(_SDT_CONTENT)
             if content is not None:
-                _walk_container(content, loc_type, prefix, out, headings)
+                _walk_container(content, loc_type, prefix, out, headings, fields)
         elif tag == _ALT_CONTENT:
             choice = child.find(_CHOICE)
             if choice is not None:
-                _walk_container(choice, loc_type, prefix, out, headings)
+                _walk_container(choice, loc_type, prefix, out, headings, fields)
 
 
 class _Located(NamedTuple):
@@ -530,6 +650,7 @@ class _Located(NamedTuple):
     detail: str
     key: str
     section: str
+    open_fields: Tuple[bool, ...] = ()   # fields open where it begins
 
 
 def _locate_paragraphs(doc) -> List[_Located]:
@@ -539,7 +660,10 @@ def _locate_paragraphs(doc) -> List[_Located]:
     `key` is ``"<part name>#<ordinal>"``. The ordinal is the position in this
     deterministic XML walk of that part, so the same physical paragraph
     receives the same key on every load of an unchanged file. `section` is
-    the heading path above a body paragraph, "" elsewhere.
+    the heading path above a body paragraph, "" elsewhere. `open_fields` is
+    the field state the paragraph begins in; its text is
+    ``paragraph_text(element, open_fields)``, and scan and apply both read it
+    that way.
     """
     collected: List[_Located] = []
 
@@ -547,9 +671,9 @@ def _locate_paragraphs(doc) -> List[_Located]:
                  headings: Optional[_HeadingTracker] = None) -> None:
         raw: List[tuple] = []
         _walk_container(root_el, loc_type, label, raw, headings)
-        for ordinal, (p_el, l_type, detail, section) in enumerate(raw):
+        for ordinal, (p_el, l_type, detail, section, open_fields) in enumerate(raw):
             collected.append(_Located(p_el, l_type, detail,
-                                      f"{part_name}#{ordinal}", section))
+                                      f"{part_name}#{ordinal}", section, open_fields))
 
     seen_parts = set()
 
@@ -621,9 +745,9 @@ def _locate_paragraphs(doc) -> List[_Located]:
                 note_id = note.get(_w('id'))
                 label = f"{base_label} {note_id}" if note_id else base_label
                 _walk_container(note, loc_type, label, raw)
-            for ordinal, (p_el, l_type, detail, _section) in enumerate(raw):
+            for ordinal, (p_el, l_type, detail, _section, open_fields) in enumerate(raw):
                 collected.append(_Located(p_el, l_type, detail,
-                                          f"{part_name}#{ordinal}", ""))
+                                          f"{part_name}#{ordinal}", "", open_fields))
 
     return collected
 
@@ -920,8 +1044,8 @@ def scan_documents_detailed(folder_path: str, rules: Union[str, Sequence[Rule]],
             results.append(file_result)
             continue
 
-        for p_el, loc_type, loc_detail, para_key, section in all_paragraphs:
-            full_text, _nodes = _paragraph_text_and_nodes(p_el)
+        for p_el, loc_type, loc_detail, para_key, section, open_fields in all_paragraphs:
+            full_text = paragraph_text(p_el, open_fields)
             if not full_text:
                 continue
 
@@ -1025,9 +1149,11 @@ _CROSSING_REASONS = {
 }
 
 
-def _crossing_reason(el) -> str:
-    """The skip reason for a match that crosses the opaque element `el`."""
-    return _CROSSING_REASONS.get(el.tag, _REASON_CROSSES_OTHER)
+def _crossing_reason(node: _TextNode) -> str:
+    """The skip reason for a match that crosses the opaque `node`."""
+    if node.in_code:
+        return _REASON_CROSSES_FIELD
+    return _CROSSING_REASONS.get(node.element.tag, _REASON_CROSSES_OTHER)
 
 
 def _edit_in_place(covered: List[_TextNode], offset: int, end: int,
@@ -1270,7 +1396,7 @@ def _edit_tracked(p_el, covered: List[_TextNode], offset: int, end: int,
 
 
 def _apply_edits(p_el, edits: Sequence[_Edit], case_sensitive: bool = True,
-                 tracked=None) -> List[_EditOutcome]:
+                 tracked=None, open_fields: Tuple[bool, ...] = ()) -> List[_EditOutcome]:
     """
     Apply several replacements to one paragraph, each addressed by offset.
 
@@ -1293,6 +1419,11 @@ def _apply_edits(p_el, edits: Sequence[_Edit], case_sensitive: bool = True,
     `tracked`, when given, is a `_TrackedContext`; the edit is then written as
     a Word revision instead of in place (see `_edit_tracked`).
 
+    `open_fields` is the field state the paragraph begins in, from
+    `_locate_paragraphs`: the scan read the text that way, so the offsets
+    only mean the same thing when apply does too. No edit changes it, because
+    a field character is never inside an edited range.
+
     Returns one `_EditOutcome` per distinct edit.
     """
     outcomes: List[_EditOutcome] = []
@@ -1311,7 +1442,7 @@ def _apply_edits(p_el, edits: Sequence[_Edit], case_sensitive: bool = True,
             outcomes.append(_EditOutcome(edit.offset, False, _REASON_MOVED))
             continue
 
-        full_text, nodes = _paragraph_text_and_nodes(p_el)
+        full_text, nodes = _paragraph_text_and_nodes(p_el, open_fields)
         offset, end = edit.offset, edit.offset + find_len
 
         # Re-verify the match is still present at this offset before touching it.
@@ -1335,7 +1466,7 @@ def _apply_edits(p_el, edits: Sequence[_Edit], case_sensitive: bool = True,
         # tracked, the insertion follows the last deletion, after it.
         crossed = next((n for n in covered if n.opaque), None)
         if crossed is not None:
-            outcomes.append(_EditOutcome(offset, False, _crossing_reason(crossed.element)))
+            outcomes.append(_EditOutcome(offset, False, _crossing_reason(crossed)))
             continue
 
         if not any(n.editable for n in covered):
@@ -1357,7 +1488,8 @@ def _apply_edits(p_el, edits: Sequence[_Edit], case_sensitive: bool = True,
 def _replace_in_paragraph(p_el, find_text: str, replace_text: str,
                           target_offsets: List[int],
                           case_sensitive: bool = True,
-                          tracked=None) -> Tuple[List[int], List[int]]:
+                          tracked=None,
+                          open_fields: Tuple[bool, ...] = ()) -> Tuple[List[int], List[int]]:
     """
     Replace specific occurrences of one search text in one paragraph.
 
@@ -1365,7 +1497,7 @@ def _replace_in_paragraph(p_el, find_text: str, replace_text: str,
     ``(applied_offsets, skipped_offsets)``.
     """
     edits = [_Edit(off, find_text, replace_text) for off in target_offsets]
-    outcomes = _apply_edits(p_el, edits, case_sensitive, tracked)
+    outcomes = _apply_edits(p_el, edits, case_sensitive, tracked, open_fields)
     applied = [o.offset for o in outcomes if o.applied]
     skipped = [o.offset for o in outcomes if not o.applied]
     return applied, skipped
@@ -1516,7 +1648,7 @@ def apply_changes(matches: List[Match], replace_text: Optional[str] = None,
                 continue
 
             try:
-                all_paragraphs = _collect_paragraphs(doc)
+                all_paragraphs = _locate_paragraphs(doc)
             except Exception as e:
                 errors.append(f"Could not read structure of {file_name}: {e}")
                 skip_all(file_matches, "document structure could not be read")
@@ -1524,7 +1656,7 @@ def apply_changes(matches: List[Match], replace_text: Optional[str] = None,
 
             tracked = _tracked_context_for(doc, author) if tracked_changes else None
 
-            para_lookup = {key: p_el for p_el, _t, _d, key in all_paragraphs}
+            para_lookup = {loc.key: loc for loc in all_paragraphs}
 
             by_paragraph: Dict[str, List[Match]] = {}
             for match in file_matches:
@@ -1545,8 +1677,8 @@ def apply_changes(matches: List[Match], replace_text: Optional[str] = None,
             file_replaced = 0
 
             for para_key, para_matches in by_paragraph.items():
-                p_el = para_lookup.get(para_key)
-                if p_el is None:
+                located = para_lookup.get(para_key)
+                if located is None:
                     skip_all(para_matches, "paragraph not found in the document")
                     continue
 
@@ -1556,7 +1688,8 @@ def apply_changes(matches: List[Match], replace_text: Optional[str] = None,
                     for m in para_matches
                 ]
                 outcomes = {o.offset: o for o in
-                            _apply_edits(p_el, edits, case_sensitive, tracked)}
+                            _apply_edits(located.element, edits, case_sensitive,
+                                         tracked, located.open_fields)}
                 for m in para_matches:
                     outcome = outcomes.get(m.char_offset)
                     if outcome is not None and outcome.applied:

@@ -5,12 +5,14 @@ Each builder constructs a real .docx on disk exercising one structure that the
 scan/replace code has to get right: hyperlinks, merged cells, linked headers,
 inline images, nested tables, text boxes and tracked insertions, plus the
 elements that are not text but sit at a place in it (pictures, note and
-comment reference marks, symbols, field characters, bookmarks).
+comment reference marks, symbols, field characters, bookmarks), and complex
+fields nested in each other or running across paragraphs.
 """
 
 import base64
 import os
 import sys
+from typing import NamedTuple
 
 import pytest
 from docx import Document
@@ -210,24 +212,96 @@ def has_styles_part(path):
         return "word/styles.xml" in z.namelist()
 
 
-def add_complex_field(paragraph, instruction, cached_result):
+class NestedField(NamedTuple):
+    instruction: object
+    result: object = None
+
+
+def nested_field(instruction, result=None):
+    """
+    A whole field to place inside another field's code or result, as one
+    piece of the `instruction` or `cached_result` of `add_complex_field` (or of
+    `add_field_begin`, `add_field_code`, `add_field_separate`). Its own
+    instruction and result take pieces the same way, so fields nest to any
+    depth. `result=None` gives a field with no separate, like an index entry.
+    """
+    return NestedField(instruction, result)
+
+
+def _add_field_pieces(paragraph, pieces, code):
+    """
+    Append `pieces` - a string or `nested_field`, or a list of them - one run
+    each. A string is field code (``w:instrText``) when `code` is true and
+    result text (``w:t``) otherwise; an empty one adds nothing.
+    """
+    if isinstance(pieces, (str, NestedField)):
+        pieces = [pieces]
+    for piece in pieces:
+        if isinstance(piece, NestedField):
+            add_complex_field(paragraph, piece.instruction, piece.result)
+        elif not piece:
+            continue
+        elif code:
+            paragraph._p.append(parse_xml(
+                '<w:r xmlns:w="%s"><w:instrText xml:space="preserve">%s</w:instrText></w:r>'
+                % (NS_W, _escape(piece))))
+        else:
+            add_run(paragraph, piece)
+
+
+def _add_fld_char(paragraph, kind):
+    paragraph._p.append(parse_xml(
+        '<w:r xmlns:w="%s"><w:fldChar w:fldCharType="%s"/></w:r>' % (NS_W, kind)))
+
+
+def add_field_begin(paragraph, instruction):
+    """
+    Open a complex field: fldChar begin, then its code. The field is finished
+    with `add_field_separate` (if it has a result) and `add_field_end`, in this
+    paragraph or a later one, since Word lets a field run across paragraphs.
+    Any other builder called in between puts its content inside the field.
+    """
+    _add_fld_char(paragraph, "begin")
+    _add_field_pieces(paragraph, instruction, code=True)
+
+
+def add_field_code(paragraph, instruction):
+    """More code for a field opened in an earlier paragraph."""
+    _add_field_pieces(paragraph, instruction, code=True)
+
+
+def add_field_separate(paragraph, result):
+    """The separate between an open field's code and its result, then result."""
+    _add_fld_char(paragraph, "separate")
+    _add_field_pieces(paragraph, result, code=False)
+
+
+def add_field_result(paragraph, result):
+    """More result for a field whose separate came in an earlier paragraph."""
+    _add_field_pieces(paragraph, result, code=False)
+
+
+def add_field_end(paragraph):
+    """Close the innermost open field."""
+    _add_fld_char(paragraph, "end")
+
+
+def add_complex_field(paragraph, instruction, cached_result=None):
     """
     Append a complex field: fldChar begin / instrText / separate / cached
-    result / fldChar end.
+    result / fldChar end, each in a run of its own.
 
     This is how Word stores a TOC entry or a cross-reference. The cached result
     lives in an ordinary <w:t>, which is why it is scanned like any other text.
+    `instruction` and `cached_result` are each a string or a list of strings
+    and `nested_field` pieces: ``[" IF ", nested_field(" REF x ", "a"),
+    ' = "a" "yes" "no" ']`` puts a REF, with its own cached result "a", inside
+    the IF's code. With no `cached_result` the field has no separate.
     """
-    parts = [
-        '<w:r><w:fldChar w:fldCharType="begin"/></w:r>',
-        '<w:r><w:instrText xml:space="preserve">%s</w:instrText></w:r>' % _escape(instruction),
-        '<w:r><w:fldChar w:fldCharType="separate"/></w:r>',
-        '<w:r><w:t xml:space="preserve">%s</w:t></w:r>' % _escape(cached_result),
-        '<w:r><w:fldChar w:fldCharType="end"/></w:r>',
-    ]
-    for part in parts:
-        xml = part.replace('<w:r>', '<w:r xmlns:w="%s">' % NS_W, 1)
-        paragraph._p.append(parse_xml(xml))
+    add_field_begin(paragraph, instruction)
+    if cached_result is not None:
+        add_field_separate(paragraph, cached_result)
+    add_field_end(paragraph)
 
 
 def add_simple_field(paragraph, instruction, cached_result):
@@ -330,7 +404,8 @@ def all_text(path):
     """Every visible paragraph's text, using the processor's own traversal."""
     import document_processor as dp
     doc = Document(path)
-    return [dp.paragraph_text(p) for p, _t, _d, _k in dp._collect_paragraphs(doc)]
+    return [dp.paragraph_text(loc.element, loc.open_fields)
+            for loc in dp._locate_paragraphs(doc)]
 
 
 # How `layout` shows an element that is not text, by local name.
@@ -383,6 +458,12 @@ def body_layouts(path):
     return [layout(p) for p in Document(path).element.body.findall(qn("w:p"))]
 
 
+def all_layouts(path):
+    """`layout` of every w:p anywhere in the body, text-box paragraphs and
+    paragraphs the processor does not collect included, in document order."""
+    return [layout(p) for p in Document(path).element.body.iter(qn("w:p"))]
+
+
 def revisions(path):
     """Every w:ins / w:del in the body, in document order, as
     (local tag, id, author, text)."""
@@ -414,7 +495,6 @@ def _resolved_texts(path, keep, render=None):
     into a string; the processor's own `paragraph_text` by default, `layout`
     to see where pictures and field characters ended up."""
     import document_processor as dp
-    render = render or dp.paragraph_text
     doc = Document(path)
     drop, unwrap = (qn("w:del"), qn("w:ins")) if keep == "ins" else (qn("w:ins"), qn("w:del"))
     for part in doc.part.package.iter_parts():
@@ -433,7 +513,10 @@ def _resolved_texts(path, keep, render=None):
                         dt.getparent().replace(dt, t)
                 el.addprevious(child)
             parent.remove(el)
-    return [render(p) for p, _t, _d, _k in dp._collect_paragraphs(doc)]
+    located = dp._locate_paragraphs(doc)
+    if render is None:
+        return [dp.paragraph_text(loc.element, loc.open_fields) for loc in located]
+    return [render(loc.element) for loc in located]
 
 
 def accept_all(path, render=None):
@@ -556,6 +639,94 @@ def article_field_doc(docdir):
     add_complex_field(p, r' REF _Ref1 \h ', "2.3")
     add_run(p, " above.")
     path = docdir / "article_field.docx"
+    doc.save(str(path))
+    return str(path)
+
+
+@pytest.fixture
+def nested_if_field_doc(docdir):
+    """
+    'Provide ' + { IF { REF SystemType } = "Wet" "..." "..." } + ' throughout.'
+
+    The REF's cached result "Wet" is an ordinary w:t, but it sits in the IF's
+    code, between the IF's begin and its separate. Word shows only the IF's
+    result, so the text reads "Provide Wet-pipe system per 2022 CBC
+    throughout." and not "Provide WetWet-pipe ...".
+    """
+    doc = Document()
+    p = doc.add_paragraph()
+    add_run(p, "Provide ")
+    add_complex_field(
+        p, [" IF ", nested_field(r" REF SystemType \h ", "Wet"),
+            ' = "Wet" "Wet-pipe system per 2022 CBC" "Dry-pipe system" '],
+        "Wet-pipe system per 2022 CBC")
+    add_run(p, " throughout.")
+    path = docdir / "nested_if.docx"
+    doc.save(str(path))
+    return str(path)
+
+
+@pytest.fixture
+def toc_doc(docdir):
+    """
+    A table of contents over three paragraphs, as Word writes one: the TOC
+    field begins in the first entry and ends in the last, and each entry
+    carries a PAGEREF field nested in the TOC's result. A body paragraph
+    follows. Entries 2 and 3 begin inside the TOC's result.
+    """
+    doc = Document()
+    entries = [("PART 1 GENERAL", "_Toc1", "1"), ("PART 2 PRODUCTS", "_Toc2", "3"),
+               ("PART 3 EXECUTION", "_Toc3", "5")]
+    for i, (title, bookmark, page) in enumerate(entries):
+        p = doc.add_paragraph()
+        if i == 0:
+            add_field_begin(p, r' TOC \o "1-3" \h \z \u ')
+            add_field_separate(p, title)
+        else:
+            add_run(p, title)
+        add_tab_run(p)
+        add_complex_field(p, r" PAGEREF %s \h " % bookmark, page)
+        if i == len(entries) - 1:
+            add_field_end(p)
+    doc.add_paragraph("Body text after the table of contents.")
+    path = docdir / "toc.docx"
+    doc.save(str(path))
+    return str(path)
+
+
+@pytest.fixture
+def field_code_across_paragraphs_doc(docdir):
+    """
+    An IF field whose text holds paragraph marks, so its code and its result
+    each run across paragraphs:
+
+    1. 'Sprinklers: ' + begin, code ' IF { REF SystemType } = "Wet" "Provide
+       wet-pipe system.'                          -> ends inside the code
+    2. code 'Coordinate with { REF Standard }.'   -> wholly inside the code
+    3. code 'Test per { REF Standard }." "Provide dry-pipe system." ',
+       separate, result 'Provide wet-pipe system.' -> begins inside the code
+    4. result 'Coordinate with { REF Standard }.' -> wholly inside the result
+    5. result 'Test per { REF Standard }.', end, ' Field ends here.'
+
+    Every REF has a cached result ("Wet", "NFPA 13"). The ones in paragraphs
+    1-3 sit in the IF's code and are not on the page.
+    """
+    standard = nested_field(r" REF Standard \h ", "NFPA 13")
+    doc = Document()
+    p1 = doc.add_paragraph()
+    add_run(p1, "Sprinklers: ")
+    add_field_begin(p1, [" IF ", nested_field(r" REF SystemType \h ", "Wet"),
+                         ' = "Wet" "Provide wet-pipe system.'])
+    add_field_code(doc.add_paragraph(), ["Coordinate with ", standard, "."])
+    p3 = doc.add_paragraph()
+    add_field_code(p3, ["Test per ", standard, '." "Provide dry-pipe system." '])
+    add_field_separate(p3, "Provide wet-pipe system.")
+    add_field_result(doc.add_paragraph(), ["Coordinate with ", standard, "."])
+    p5 = doc.add_paragraph()
+    add_field_result(p5, ["Test per ", standard, "."])
+    add_field_end(p5)
+    add_run(p5, " Field ends here.")
+    path = docdir / "field_code_across_paragraphs.docx"
     doc.save(str(path))
     return str(path)
 

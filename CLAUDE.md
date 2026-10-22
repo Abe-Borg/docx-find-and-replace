@@ -34,7 +34,12 @@ even though the code is platform-neutral.
 ## The one architectural rule
 
 **Paragraph text, character offsets, and the XML nodes holding the text must all
-come from a single traversal.** `_paragraph_text_and_nodes()` is that traversal.
+come from a single traversal.** `_walk_paragraph()` is that traversal. Its
+full result is the text, the nodes and the fields still open where the
+paragraph ends; `_paragraph_text_and_nodes()` (text, nodes) and
+`paragraph_text()` are projections of it and stay that way, because tests
+unpack the first as a 2-tuple. All three take the paragraph's `open_fields`
+(rule 18).
 
 Every silent-corruption bug this codebase has had came from mixing two views of
 a document that were assumed to agree and did not:
@@ -50,8 +55,8 @@ Do not reintroduce `paragraph.text`, `paragraph.runs`, `doc.paragraphs`,
 `doc.tables` or `row.cells` into the scan or replace paths. Walk the XML.
 
 `_locate_paragraphs` is the traversal's full result (element, type, detail,
-key, section); `_collect_paragraphs` is its four-field projection and stays
-that way, because tests and the selftest unpack it as a 4-tuple.
+key, section, open_fields); `_collect_paragraphs` is its four-field projection
+and stays that way, because tests and the selftest unpack it as a 4-tuple.
 
 ## Rules that exist because breaking them destroyed documents
 
@@ -147,6 +152,17 @@ that way, because tests and the selftest unpack it as a 4-tuple.
     beside the new text. Do not "fix" this by giving the element a character
     in the text: a sentinel would leak into the context, the heading labels
     and every offset.
+18. **A paragraph's text depends on the fields open where it begins.** A
+    field's code (begin to separate) is not text, even where it holds a `w:t`,
+    and a field can begin in one paragraph and end in a later one, so a
+    paragraph can begin inside a code. Read on its own, that paragraph shows
+    the cached results of fields nested in the code as text, and the offsets
+    no longer match the scan's. `_locate_paragraphs` records each paragraph's
+    `open_fields`, and the scan (`paragraph_text(el, open_fields)`) and the
+    apply (`_apply_edits(..., open_fields)`) both read the paragraph with it.
+    Anything new that reads paragraph text for a scan or an apply gets the
+    paragraph from `_locate_paragraphs`, never from `_collect_paragraphs`,
+    which drops `open_fields`.
 
 ## Traversal specifics
 
@@ -158,13 +174,14 @@ Add to the allowlist only after confirming the element cannot contain a nested
 `w:txbxContent`.
 
 An element the walk does not enter still has a position in the text, and
-`_paragraph_text_and_nodes` records it there as an **opaque** `_TextNode`:
+`_walk_paragraph` records it there as an **opaque** `_TextNode`:
 length 0, not editable, `opaque=True`, with nothing added to the text. That
 covers pictures (`w:drawing`, `w:pict`, `w:object`, `mc:AlternateContent` in a
 run), equations, note and comment reference marks, `w:sym`, `w:fldChar`,
-`w:instrText`, `w:fldSimple` and `w:del`/`w:moveFrom`. The text, offsets,
-context and heading labels are exactly what they were before opaque nodes
-existed. An opaque node is "covered" by
+`w:instrText`, `w:fldSimple` and `w:del`/`w:moveFrom`, and every element,
+text included, inside a field's code (below). Apart from that code, the text,
+offsets, context and heading labels are exactly what they were before opaque
+nodes existed. An opaque node is "covered" by
 `n.start < end and n.start + n.length > offset` only when it sits strictly
 inside the range, which is the case `_apply_edits` refuses (rule 17).
 
@@ -217,12 +234,44 @@ Note the asymmetry: a **complex** field (`w:fldChar` begin / `w:instrText` /
 separate / result / end) keeps its cached result in ordinary `w:r`/`w:t` runs,
 so the walk does scan and replace it. Word regenerates that text on field
 update, which reverts the replacement — README documents this under "Field
-results can revert". Only `w:instrText` (the field code) is never read. The
-`w:fldChar`s and the `w:instrText` are opaque nodes, so a match wholly inside
-one result is replaced, while one that runs across begin, separate or end is
+results can revert". The field's **code** is never read: everything from begin
+to separate, or to end when there is no separate (an `XE` index entry). That is
+more than `w:instrText`. A field nested in another field's code keeps its own
+cached result there as an ordinary `w:t` — `{ IF { REF x } = "a" "yes" "no" }`
+stores the REF's "a" between the IF's begin and separate — and reading every
+`w:t` used to put that "a" in front of the "yes" Word shows.
+
+`_walk_paragraph` keeps a stack of the open fields, one flag each, True from
+begin to separate and False from separate to end (`_step_fields`). While any
+flag is True, every element reached, `w:t` included, is an opaque node with
+`in_code=True` and adds nothing to the text; `_crossing_reason` reports it as
+a field boundary, and `_walk_textboxes` skips a text box whose drawing is one.
+Counting per field matters: a nested field's separate does not end the outer
+field's code, and a field with no separate closes at its end. A field nested
+in a *result* (a TOC entry's `PAGEREF`) is result like the rest. A separate or
+an end with no open field is ignored. `w:fldChar`s inside `w:del`,
+`w:moveFrom`, `w:fldSimple` or a drawing are not walked, so they do not count.
+
+The stack does not reset at a paragraph mark. Word pairs field characters
+across a whole **story**: a TOC begins in its first entry and ends in its last,
+and an IF whose text holds a paragraph mark has a code and a result that each
+run across paragraphs. `_walk_container` carries the stack from paragraph to
+paragraph in an `_OpenFields`, through the body and its table cells (a table
+can sit inside a code), one header or footer part, one note or comment, or one
+text box; each story starts with none, so nothing carries from one into
+another. The decision for a paragraph that begins inside a field begun
+earlier is therefore Word's own: inside a result it is read as result (the
+TOC's later entries), inside a code it is code until that field's separate,
+and a paragraph wholly inside a code has no text. The state each paragraph
+begins in is `_Located.open_fields`, which is why rule 18 exists. An edit
+never changes it, because no field character is ever inside an edited range.
+
+The `w:fldChar`s and the code are opaque nodes, so a match wholly inside one
+result is replaced, while one that runs across begin, separate or end is
 skipped with `_REASON_CROSSES_FIELD`. The insertion of a tracked edit inside a
 result lands inside it, between separate and end. If you change any of this,
-change the README bullet in the same commit.
+change the README in the same commit (Document Coverage, "Field codes and
+fields that span paragraphs", Known Limitations).
 
 ## Testing
 
@@ -241,14 +290,21 @@ tables, text boxes (VML and `mc:AlternateContent`), footnotes/endnotes/comments
 and their reference marks, complex and simple fields, symbols and other
 single elements in a run, bookmarks, tracked changes, formatted runs,
 `w:rPrChange`, heading styles and outline levels; extend it rather than
-hand-rolling XML in a test.
+hand-rolling XML in a test. `add_complex_field` takes its instruction and
+result as pieces, so `nested_field(...)` nests fields to any depth, in a code
+or a result. `add_field_begin` / `add_field_code` / `add_field_separate` /
+`add_field_result` / `add_field_end` split one field across paragraphs, and any
+other builder called between them puts its content inside the field.
 
 Where a picture or a field character ends up is asserted through `layout` /
 `body_layouts`, which draw a paragraph with every non-text element in place
 (`"Refer to Article {begin}{separate}2.3{end} above."`) using a walk of their
 own. A test about rule 17 must not trust the processor's traversal to say
 where the element is. `accept_all(path, render=layout)` gives the same view
-after a simulated Accept All.
+after a simulated Accept All. `layout` shows every `w:t`, code or not, so it is
+also how a test states that a field's code was left as it was. `all_layouts`
+draws every `w:p` in the body, table-cell and text-box paragraphs included,
+even ones the processor does not collect.
 
 Tracked-changes tests assert through `revisions()`, `all_revision_ids()`,
 `accept_all()` and `reject_all()` in conftest: the last two simulate Word's

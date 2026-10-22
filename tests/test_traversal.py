@@ -26,7 +26,7 @@ def test_hyperlink_text_is_included(hyperlink_doc):
 
 
 @pytest.mark.parametrize("fixture", ["hyperlink_doc", "figure_reference_doc",
-                                     "article_field_doc"])
+                                     "article_field_doc", "nested_if_field_doc"])
 def test_text_and_node_map_are_built_from_the_same_walk(request, fixture):
     """
     Every character of the extracted text must be owned by a node in the map.
@@ -34,7 +34,8 @@ def test_text_and_node_map_are_built_from_the_same_walk(request, fixture):
     This is the invariant that failed before: text came from Paragraph.text
     (which includes hyperlinks) while the offset map came from Paragraph.runs
     (which does not), so replacements landed at the wrong offset. Opaque nodes
-    (a picture, field characters) own no characters and keep it intact.
+    (a picture, field characters, anything in a field's code) own no
+    characters and keep it intact.
     """
     doc = Document(request.getfixturevalue(fixture))
     p_el = dp._collect_paragraphs(doc)[0][0]
