@@ -9,9 +9,11 @@ import os
 
 import pytest
 from docx import Document
+from docx.oxml.ns import qn
 
 import document_processor as dp
-from conftest import add_run, add_hyperlink, add_runs
+from conftest import (add_bookmark_end, add_bookmark_start, add_hyperlink, add_note_reference,
+                      add_notes_part, add_run, add_run_with_element, add_runs)
 
 
 # ----------------------------------------------------- text extraction
@@ -23,15 +25,18 @@ def test_hyperlink_text_is_included(hyperlink_doc):
     assert dp.paragraph_text(p_el) == "See 2022 CBC link and done."
 
 
-def test_text_and_node_map_are_built_from_the_same_walk(hyperlink_doc):
+@pytest.mark.parametrize("fixture", ["hyperlink_doc", "figure_reference_doc",
+                                     "article_field_doc"])
+def test_text_and_node_map_are_built_from_the_same_walk(request, fixture):
     """
     Every character of the extracted text must be owned by a node in the map.
 
     This is the invariant that failed before: text came from Paragraph.text
     (which includes hyperlinks) while the offset map came from Paragraph.runs
-    (which does not), so replacements landed at the wrong offset.
+    (which does not), so replacements landed at the wrong offset. Opaque nodes
+    (a picture, field characters) own no characters and keep it intact.
     """
-    doc = Document(hyperlink_doc)
+    doc = Document(request.getfixturevalue(fixture))
     p_el = dp._collect_paragraphs(doc)[0][0]
     text, nodes = dp._paragraph_text_and_nodes(p_el)
 
@@ -68,6 +73,57 @@ def test_tabs_and_breaks_become_characters(docdir):
     reloaded = Document(str(path))
     p_el = dp._collect_paragraphs(reloaded)[0][0]
     assert dp.paragraph_text(p_el) == "A\tB"
+
+
+def test_a_picture_is_an_opaque_position_that_adds_no_text(figure_reference_doc):
+    doc = Document(figure_reference_doc)
+    p_el = dp._collect_paragraphs(doc)[0][0]
+    text, nodes = dp._paragraph_text_and_nodes(p_el)
+    assert text == "See Figure 3 for riser detail"
+    assert [(n.element.tag, n.start, n.length, n.editable) for n in nodes if n.opaque] == [
+        (qn("w:drawing"), 10, 0, False)]
+
+
+def test_field_characters_are_opaque_positions_around_the_result(article_field_doc):
+    """begin, the field code and separate sit where the result starts; end
+    where it stops. The field code itself is still never read as text."""
+    doc = Document(article_field_doc)
+    p_el = dp._collect_paragraphs(doc)[0][0]
+    text, nodes = dp._paragraph_text_and_nodes(p_el)
+    assert text == "Refer to Article 2.3 above."
+    assert [(n.element.tag, n.start) for n in nodes if n.opaque] == [
+        (qn("w:fldChar"), 17), (qn("w:instrText"), 17),
+        (qn("w:fldChar"), 17), (qn("w:fldChar"), 20)]
+
+
+def test_properties_and_markers_are_not_positions(docdir):
+    """Run properties, bookmarks and the page-break cache show nothing; only
+    the footnote reference mark is opaque."""
+    doc = Document()
+    add_notes_part(doc, "footnote", ["The note."])
+    p = doc.add_paragraph()
+    add_bookmark_start(p, 0, "_GoBack")
+    add_bookmark_end(p, 0)
+    add_run_with_element(p, "Per NFPA", "lastRenderedPageBreak", " 13")
+    add_note_reference(p, "footnote", 2)     # its run carries a w:rPr
+    path = docdir / "markers.docx"
+    doc.save(str(path))
+
+    p_el = dp._collect_paragraphs(Document(str(path)))[0][0]
+    text, nodes = dp._paragraph_text_and_nodes(p_el)
+    assert text == "Per NFPA 13"
+    assert [(n.element.tag, n.start) for n in nodes if n.opaque] == [
+        (qn("w:footnoteReference"), 11)]
+
+
+def test_context_around_a_picture_has_no_stray_character(figure_reference_doc):
+    """Opaque positions add nothing to the text, so nothing leaks into the
+    context the results tree shows."""
+    results = dp.scan_documents(os.path.dirname(figure_reference_doc), "Figure 3")
+    (match,) = [m for r in results for m in r.matches]
+    assert (match.context_before, match.match_text, match.context_after) == (
+        "See ", "Figure 3", " for riser detail")
+    assert match.display_context == "See [Figure 3] for riser detail"
 
 
 def _tab_element():
