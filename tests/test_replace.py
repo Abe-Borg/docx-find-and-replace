@@ -6,9 +6,10 @@ explicitly changing.
 import pytest
 from docx import Document
 from docx.oxml.ns import qn
+from lxml import etree
 
 import document_processor as dp
-from conftest import add_run, add_hyperlink, count_drawings
+from conftest import add_run, add_hyperlink, body_layouts, count_drawings, layout
 
 
 def _para(path, predicate=lambda t: True):
@@ -43,22 +44,36 @@ def test_hyperlink_relationship_survives(hyperlink_doc, tmp_path):
     assert p[0].get(qn("r:id"))
 
 
-def test_cross_run_match_preserves_inline_image(image_in_run_doc, tmp_path):
+def test_cross_run_match_preserves_inline_image(image_beside_match_doc, tmp_path):
     """
     Assigning Run.text calls clear_content(), which strips every child of the
-    run including the image. Editing w:t text in place does not.
+    run including the image. Editing w:t text in place does not, and the
+    picture beside the match stays where it was.
     """
-    assert count_drawings(image_in_run_doc) == 1
+    assert count_drawings(image_beside_match_doc) == 1
 
-    doc, p_el = _para(image_in_run_doc)
+    doc, p_el = _para(image_beside_match_doc)
     applied, _ = dp._replace_in_paragraph(p_el, "2022 CBC", "2025 CBC", [11])
     assert applied == [11]
 
     out = tmp_path / "out.docx"
     doc.save(str(out))
-    assert dp.paragraph_text(Document(str(out)).element.body.findall(".//" + qn("w:p"))[0]) \
-        == "See Figure 2025 CBC ref"
+    assert body_layouts(str(out))[0] == "See Figure [drawing]2025 CBC ref"
     assert count_drawings(str(out)) == 1
+
+
+def test_cross_run_match_across_an_inline_image_is_refused_untouched(image_in_run_doc):
+    """
+    The picture sits between "20" and "22". Writing "2025 CBC" into the first
+    w:t would leave it after the new text, so the edit is refused and the
+    paragraph's XML is exactly what it was.
+    """
+    doc, p_el = _para(image_in_run_doc)
+    before = etree.tostring(p_el)
+    applied, skipped = dp._replace_in_paragraph(p_el, "2022 CBC", "2025 CBC", [11])
+    assert (applied, skipped) == ([], [11])
+    assert etree.tostring(p_el) == before
+    assert layout(p_el) == "See Figure 20[drawing]22 CBC ref"
 
 
 def test_cross_run_match_preserves_run_formatting(split_run_doc, tmp_path):

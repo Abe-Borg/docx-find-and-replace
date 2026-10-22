@@ -3,7 +3,9 @@ Shared fixtures for the document_processor test suite.
 
 Each builder constructs a real .docx on disk exercising one structure that the
 scan/replace code has to get right: hyperlinks, merged cells, linked headers,
-inline images, nested tables, text boxes and tracked insertions.
+inline images, nested tables, text boxes and tracked insertions, plus the
+elements that are not text but sit at a place in it (pictures, note and
+comment reference marks, symbols, field characters, bookmarks).
 """
 
 import base64
@@ -109,6 +111,61 @@ def add_run_with_rpr_change(paragraph, text, change_id=902):
 def add_tab_run(paragraph):
     """Append a run holding only a <w:tab/>."""
     paragraph._p.append(parse_xml('<w:r xmlns:w="%s"><w:tab/></w:r>' % NS_W))
+
+
+def add_picture_run(paragraph, png_path, before="", after=""):
+    """
+    Append one run holding `before` text, a real inline picture, then `after`
+    text: ``<w:r><w:t>before</w:t><w:drawing/><w:t>after</w:t></w:r>``.
+    """
+    run = paragraph.add_run()
+    if before:
+        run.add_text(before)
+    run.add_picture(png_path, width=Inches(0.2))
+    if after:
+        run.add_text(after)
+    return run
+
+
+def add_run_with_element(paragraph, before, element, after):
+    """
+    Append one run holding `before` text, a single empty w: element, then
+    `after` text. `element` is the tag and its attributes without the prefix,
+    e.g. ``'sym w:font="Symbol" w:char="F0B0"'`` or ``'lastRenderedPageBreak'``.
+    """
+    inner = ""
+    if before:
+        inner += '<w:t xml:space="preserve">%s</w:t>' % _escape(before)
+    inner += "<w:%s/>" % element
+    if after:
+        inner += '<w:t xml:space="preserve">%s</w:t>' % _escape(after)
+    paragraph._p.append(parse_xml('<w:r xmlns:w="%s">%s</w:r>' % (NS_W, inner)))
+
+
+def add_note_reference(paragraph, kind, note_id):
+    """
+    Append the run Word writes for a note or comment reference mark. `kind` is
+    "footnote", "endnote" or "comment"; `note_id` should name an entry that
+    `add_notes_part` created (its first entry is id 2).
+    """
+    style = {"footnote": "FootnoteReference", "endnote": "EndnoteReference",
+             "comment": "CommentReference"}[kind]
+    xml = ('<w:r xmlns:w="%s"><w:rPr><w:rStyle w:val="%s"/></w:rPr>'
+           '<w:%sReference w:id="%d"/></w:r>' % (NS_W, style, kind, note_id))
+    paragraph._p.append(parse_xml(xml))
+
+
+def add_bookmark_start(paragraph, bookmark_id, name):
+    """Append a <w:bookmarkStart> among the paragraph's runs."""
+    paragraph._p.append(parse_xml(
+        '<w:bookmarkStart xmlns:w="%s" w:id="%d" w:name="%s"/>'
+        % (NS_W, bookmark_id, _escape(name))))
+
+
+def add_bookmark_end(paragraph, bookmark_id):
+    """Append the <w:bookmarkEnd> closing `bookmark_id`."""
+    paragraph._p.append(parse_xml(
+        '<w:bookmarkEnd xmlns:w="%s" w:id="%d"/>' % (NS_W, bookmark_id)))
 
 
 def add_paragraph_with_outline_level(doc, text, level):
@@ -276,6 +333,56 @@ def all_text(path):
     return [dp.paragraph_text(p) for p, _t, _d, _k in dp._collect_paragraphs(doc)]
 
 
+# How `layout` shows an element that is not text, by local name.
+_LAYOUT_MARKS = {
+    "drawing": "[drawing]", "pict": "[pict]", "object": "[object]",
+    "footnoteReference": "[footnote]", "endnoteReference": "[endnote]",
+    "commentReference": "[comment]", "sym": "[sym]", "fldSimple": "[fldSimple]",
+    "softHyphen": "[softHyphen]", "del": "[del]", "moveFrom": "[del]",
+    "bookmarkStart": "[bm]", "bookmarkEnd": "[/bm]",
+}
+
+
+def layout(p_el):
+    """
+    A w:p as its text with every non-text element shown where it sits, e.g.
+    ``"See Figure 20[drawing]22 CBC ref"`` or
+    ``"Article {begin}{separate}2.3{end} above"``. Field codes (w:instrText) are
+    left out, as Word does. The walk is its own, independent of the processor's
+    traversal, so a test can state where a picture or a field character is
+    without trusting the code under test to say so.
+    """
+    out = []
+
+    def visit(el):
+        for child in el:
+            if not isinstance(child.tag, str):
+                continue
+            local = child.tag.rsplit("}", 1)[-1]
+            if child.tag == qn("w:t"):
+                out.append(child.text or "")
+            elif child.tag == qn("w:tab"):
+                out.append("\t")
+            elif child.tag in (qn("w:br"), qn("w:cr")):
+                out.append("\n")
+            elif child.tag == qn("w:fldChar"):
+                out.append("{%s}" % child.get(qn("w:fldCharType")))
+            elif child.tag in (qn("w:instrText"), qn("w:pPr"), qn("w:rPr")):
+                continue
+            elif child.tag.startswith("{%s}" % NS_W) and local in _LAYOUT_MARKS:
+                out.append(_LAYOUT_MARKS[local])
+            else:
+                visit(child)
+
+    visit(p_el)
+    return "".join(out)
+
+
+def body_layouts(path):
+    """`layout` of every top-level body paragraph, in order."""
+    return [layout(p) for p in Document(path).element.body.findall(qn("w:p"))]
+
+
 def revisions(path):
     """Every w:ins / w:del in the body, in document order, as
     (local tag, id, author, text)."""
@@ -301,10 +408,13 @@ def all_revision_ids(path):
     return ids
 
 
-def _resolved_texts(path, keep):
+def _resolved_texts(path, keep, render=None):
     """Paragraph texts after simulating Word's Accept All (keep='ins') or
-    Reject All (keep='del') on the whole package."""
+    Reject All (keep='del') on the whole package. `render` turns each w:p
+    into a string; the processor's own `paragraph_text` by default, `layout`
+    to see where pictures and field characters ended up."""
     import document_processor as dp
+    render = render or dp.paragraph_text
     doc = Document(path)
     drop, unwrap = (qn("w:del"), qn("w:ins")) if keep == "ins" else (qn("w:ins"), qn("w:del"))
     for part in doc.part.package.iter_parts():
@@ -323,15 +433,15 @@ def _resolved_texts(path, keep):
                         dt.getparent().replace(dt, t)
                 el.addprevious(child)
             parent.remove(el)
-    return [dp.paragraph_text(p) for p, _t, _d, _k in dp._collect_paragraphs(doc)]
+    return [render(p) for p, _t, _d, _k in dp._collect_paragraphs(doc)]
 
 
-def accept_all(path):
-    return _resolved_texts(path, "ins")
+def accept_all(path, render=None):
+    return _resolved_texts(path, "ins", render)
 
 
-def reject_all(path):
-    return _resolved_texts(path, "del")
+def reject_all(path, render=None):
+    return _resolved_texts(path, "del", render)
 
 
 # ---------------------------------------------------------------- fixtures
@@ -386,15 +496,66 @@ def merged_and_linked_doc(docdir):
 
 @pytest.fixture
 def image_in_run_doc(docdir, png_file):
-    """A match spanning three runs, the middle of which carries an inline image."""
+    """
+    'See Figure 20' | [picture]'22' | ' CBC ref'. "2022 CBC" spans three runs
+    and the picture sits inside it, between "20" and "22", so that match must
+    be skipped: applying it would move the picture.
+    """
     doc = Document()
     p = doc.add_paragraph()
     add_run(p, "See Figure 20")
-    run = p.add_run()
-    run.add_picture(png_file, width=Inches(0.2))
-    run.add_text("22")
+    add_picture_run(p, png_file, after="22")
     add_run(p, " CBC ref")
     path = docdir / "image.docx"
+    doc.save(str(path))
+    return str(path)
+
+
+@pytest.fixture
+def image_beside_match_doc(docdir, png_file):
+    """
+    'See Figure ' | [picture]'20' | '22 CBC ref'. "2022 CBC" spans two runs and
+    the first of them carries a picture, just outside the match: the edit is
+    applied and the picture has to survive it, in place.
+    """
+    doc = Document()
+    p = doc.add_paragraph()
+    add_run(p, "See Figure ")
+    add_picture_run(p, png_file, after="20")
+    add_run(p, "22 CBC ref")
+    path = docdir / "image_beside.docx"
+    doc.save(str(path))
+    return str(path)
+
+
+@pytest.fixture
+def figure_reference_doc(docdir, png_file):
+    """
+    ``<w:r><w:t>See Figure</w:t><w:drawing/></w:r><w:r><w:t> 3 for riser
+    detail</w:t></w:r>``: the text reads "See Figure 3 for riser detail" with
+    a picture between "Figure" and " 3".
+    """
+    doc = Document()
+    p = doc.add_paragraph()
+    add_picture_run(p, png_file, before="See Figure")
+    add_run(p, " 3 for riser detail")
+    path = docdir / "figure_ref.docx"
+    doc.save(str(path))
+    return str(path)
+
+
+@pytest.fixture
+def article_field_doc(docdir):
+    """
+    'Refer to Article ' + a REF field whose cached result is '2.3' + ' above.'
+    The text reads "Refer to Article 2.3 above."
+    """
+    doc = Document()
+    p = doc.add_paragraph()
+    add_run(p, "Refer to Article ")
+    add_complex_field(p, r' REF _Ref1 \h ', "2.3")
+    add_run(p, " above.")
+    path = docdir / "article_field.docx"
     doc.save(str(path))
     return str(path)
 

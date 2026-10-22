@@ -16,7 +16,7 @@ import document_processor as dp
 from conftest import (accept_all, add_deletion, add_formatted_run, add_hyperlink,
                       add_notes_part, add_run, add_run_with_rpr_change, add_runs,
                       add_tab_run, add_tracked_insertion, all_revision_ids, all_text,
-                      count_drawings, reject_all, revisions)
+                      count_drawings, layout, reject_all, revisions)
 
 
 def _scan(path, find, **kw):
@@ -110,15 +110,21 @@ def test_prefix_and_suffix_of_a_partially_covered_run_keep_formatting(docdir):
 
 # ---------------------------------------------------------------- run contents
 
-def test_inline_image_is_not_marked_deleted(image_in_run_doc):
-    _apply(_scan(image_in_run_doc, "2022 CBC"), "2025 CBC")
-    body = _body(image_in_run_doc)
-    assert count_drawings(image_in_run_doc) == 1
+def test_inline_image_is_not_marked_deleted(image_beside_match_doc):
+    """The picture shares a run with the matched "20"; it is split off, never
+    wrapped, and stays in front of the new text. A picture *inside* a match is
+    skipped instead (test_crossing.py)."""
+    result = _apply(_scan(image_beside_match_doc, "2022 CBC"), "2025 CBC")
+    assert result['total_replaced'] == 1
+    body = _body(image_beside_match_doc)
+    assert count_drawings(image_beside_match_doc) == 1
     drawing = body.find(".//" + qn("w:drawing"))
     ancestors = {a.tag for a in drawing.iterancestors()}
     assert qn("w:del") not in ancestors and qn("w:ins") not in ancestors
-    assert accept_all(image_in_run_doc)[0] == "See Figure 2025 CBC ref"
-    assert reject_all(image_in_run_doc)[0] == "See Figure 2022 CBC ref"
+    assert accept_all(image_beside_match_doc, render=layout)[0] == \
+        "See Figure [drawing]2025 CBC ref"
+    assert reject_all(image_beside_match_doc, render=layout)[0] == \
+        "See Figure [drawing]2022 CBC ref"
 
 
 def test_tracked_formatting_change_is_kept_on_the_original_run_only(docdir):

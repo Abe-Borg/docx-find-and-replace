@@ -23,7 +23,7 @@ A code-cycle update is rarely one replacement. It is a dozen — "2022 CBC" → 
 - **Cross-run matching** — Finds text even when Word has split it across multiple formatting runs (a common issue with `python-docx`)
 - **Hyperlink-aware** — Text inside hyperlinks is searched and replaced at the correct offset, and the link relationship survives
 - **Accurate match counts** — A physical paragraph is visited exactly once, so merged table cells and headers shared between sections are counted and replaced once, not once per section or spanned column
-- **Non-destructive replacement** — Inline images, footnote and comment references, and field characters sharing a run with matched text are left intact
+- **Non-destructive replacement** — Inline images, footnote and comment references, and field characters sharing a run with matched text are left intact and where they were. A match that would run across one (a picture between its words, a footnote mark, an inserted symbol, the edge of a field) is skipped with a reason rather than applied
 - **Formatting preservation** — Replacement text inherits the formatting of the run it lands in; surrounding runs keep bold, italic, font and color
 - **Timestamped backups** — Optional `.bak` files that never overwrite each other, so the true original stays recoverable across repeated runs
 - **Atomic saves** — Documents are written to a temporary file and swapped into place, so an interrupted save cannot truncate the original
@@ -148,6 +148,7 @@ docx-find-and-replace/
 │   ├── test_apply.py       # End-to-end scan → apply, backups, reporting
 │   ├── test_rules.py       # Rule sets, whole word, overlap conflicts, subfolders
 │   ├── test_tracked.py     # Tracked-changes mode, checked by simulated Accept/Reject
+│   ├── test_crossing.py    # Matches across pictures, marks, symbols and field edges
 │   ├── test_sections.py    # Heading path detection
 │   ├── test_changelog.py   # Change log CSV, backup discovery and restore
 │   ├── test_settings.py    # Rule-set files and the settings file
@@ -168,7 +169,7 @@ Scanned and replaced:
 - Text boxes
 - Text inside hyperlinks
 - Text inside tracked insertions (`w:ins`), smart tags, and content controls
-- The cached result of a complex field — a cross-reference or a table of contents entry — which Word stores as ordinary text (see [Known Limitations](#known-limitations): these replacements can revert)
+- The cached result of a complex field — a cross-reference or a table of contents entry — which Word stores as ordinary text (see [Known Limitations](#known-limitations): these replacements can revert). The match has to lie wholly inside the result; one that runs across the field's edge is skipped
 
 Deliberately not touched:
 
@@ -176,6 +177,7 @@ Deliberately not touched:
 - Word's footnote separator entries — rule lines, not content
 - Field codes (`w:instrText`) — editing the instruction would break the field
 - Cached results inside `w:fldSimple` — the simple-field form is not descended into
+- A match that runs across a picture, an equation or other embedded object, a footnote, endnote or comment reference mark, an inserted symbol, the edge of a field, or a tracked deletion — skipped with a reason, because applying it would move that element (see [Matches that cross something that is not text](#matches-that-cross-something-that-is-not-text))
 
 See [Known Limitations](#known-limitations) for content that is not reached at all.
 
@@ -193,7 +195,7 @@ In place, a replacement is written straight into the run's text. As a tracked ch
 
 A run often carries more than text — an inline image, a footnote reference, a field character. Before anything is wrapped, the matched text is split into a run of its own and everything else moves to sibling runs that are never wrapped, so an image sharing a run with the matched text is not marked as deleted. The inserted text takes the formatting of the first run of the matched text, as Word does when typing over a selection.
 
-Two structures are refused rather than guessed at, and reported with a reason: a match inside text that is itself a tracked insertion (Word has no representation for an insertion inside an insertion — accept or reject that revision in Word first, or run without tracked changes), and a match inside a comment (Word does not track revisions in comment text). Running tracked mode twice without accepting in between therefore skips matches inside the first run's insertions.
+Two structures are refused rather than guessed at, and reported with a reason: a match inside text that is itself a tracked insertion (Word has no representation for an insertion inside an insertion — accept or reject that revision in Word first, or run without tracked changes), and a match inside a comment (Word does not track revisions in comment text). Running tracked mode twice without accepting in between therefore skips matches inside the first run's insertions. A match that runs across a picture, a reference mark, a symbol or a field's edge is skipped in this mode too, for the reason given under [Matches that cross something that is not text](#matches-that-cross-something-that-is-not-text).
 
 ### Section context
 
@@ -232,6 +234,16 @@ Walking the XML visits each physical `w:tc` and each header *part* exactly once,
 
 Replacements are written directly into `w:t` element text. Assigning to `Run.text` would call `clear_content()`, which strips *every* child of the run — destroying inline images, footnote references, comment anchors and field characters that happen to share a run with the matched text.
 
+### Matches that cross something that is not text
+
+Some of those elements sit *between* words: an inline picture placed after "Figure", a footnote mark after "NFPA 13", a degree sign inserted from Insert > Symbol, the hidden characters that open and close a cross-reference field. None of them adds a character to the paragraph's text, so "Figure 3" matches "See Figure 3 for riser detail" even when a picture sits between "Figure" and " 3". Applying that match would move the picture: in place the new text goes into the first run, ahead of the picture, giving "See Detail 7" followed by the picture. Across a field's edge it is worse. With "Refer to Article " + a cross-reference showing "2.3" + " above.", replacing "2.3 above" with "2.4 below" would write the new words into the field's result, and the next time Word updates fields it would regenerate "2.3" and the word "below" would be gone.
+
+So the same single walk that builds the text also records where each such element sits, as a position with no width. A match with one of those positions strictly inside it is skipped, with a reason that says what it crosses (for example "crosses a picture, equation or embedded object" or "crosses a field boundary"). Nothing in that paragraph is changed for it, and other matches in the same paragraph are still applied. A match that only starts or ends next to the element is applied, and the element stays beside the new text. A match wholly inside one field result is still replaced, as before (see [Known Limitations](#known-limitations): field results can revert).
+
+What counts: everything in a paragraph except text, tabs and breaks, the containers that hold text (runs, hyperlinks, tracked insertions, content controls, smart tags), and a short list of markers that show nothing (formatting properties, bookmarks, the ends of a comment's highlighted range, proofing marks, Word's cached page-break position). That list is an allowlist, so an element the tool does not know is refused rather than moved. Tracked deletions count as well, because moving one would make Reject All put the deleted words back in the wrong place.
+
+The preview still lists such a match; the completion dialog and the change log report it as skipped with its reason, so it can be changed by hand in Word.
+
 ### Guarding against a document that changed underneath the preview
 
 A preview records character offsets into one particular version of a file. If
@@ -255,7 +267,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The suite builds real `.docx` files on disk for each structure the replacement logic has to get right — hyperlinks, merged cells, headers linked across sections, inline images inside a spanned run, nested tables, text boxes in both VML and `mc:AlternateContent` form, footnotes, endnotes, comments, complex fields, tracked changes, and heading styles — then asserts on the resulting documents. Each test named after a corruption case asserts the document is left *correct*, not merely that the call returned without raising. Tracked-changes output is checked by simulating Word's Accept All and Reject All over the saved file and comparing both against the in-place result and the original.
+The suite builds real `.docx` files on disk for each structure the replacement logic has to get right — hyperlinks, merged cells, headers linked across sections, inline images inside a spanned run, nested tables, text boxes in both VML and `mc:AlternateContent` form, footnotes, endnotes, comments, complex fields, tracked changes, and heading styles — then asserts on the resulting documents. Pictures, reference marks, symbols and field characters inside and beside a match are checked by drawing each paragraph with every non-text element shown where it sits (`See Figure[drawing] 3 for riser detail`), using a walk of its own rather than the code under test. Each test named after a corruption case asserts the document is left *correct*, not merely that the call returned without raising. Tracked-changes output is checked by simulating Word's Accept All and Reject All over the saved file and comparing both against the in-place result and the original.
 
 The GUI is covered too, headlessly. `tests/tkstub.py` is a small tkinter
 stand-in, so `test_gui.py` can exercise the window's decisions — which status
@@ -316,7 +328,9 @@ CI runs this against both built executables before the installer is packaged.
 - **Section detection needs outline levels** — Templates whose part and article styles carry no outline level and are not named "heading N" show an empty Section column. Word's automatic numbering is not shown in the path
 - **Double-click also clicks** — Word's convention: a double-click on a row first delivers the two single clicks, which toggle the checkbox twice and cancel out. A slow double-click can leave the row toggled
 - **Text box fallback copies** — Word stores a text box twice, as a modern `mc:Choice` copy and a legacy `mc:Fallback` copy. Only the `mc:Choice` copy is replaced, which is what current versions of Word render; the fallback copy retains the old text until Word next re-saves the file
-- **Field results can revert** — Word stores a complex field's cached result (a cross-reference, a table of contents entry) as ordinary text, so it *is* scanned and replaced like any other text. But Word regenerates that text from the field code the next time the field updates, which silently undoes the replacement. For a table of contents, replace the underlying heading text and update the field rather than relying on the cached entry. The field code itself is never touched, and results inside the older `w:fldSimple` form are not scanned at all
+- **Field results can revert** — Word stores a complex field's cached result (a cross-reference, a table of contents entry) as ordinary text, so a match wholly inside it *is* scanned and replaced like any other text. But Word regenerates that text from the field code the next time the field updates, which silently undoes the replacement. For a table of contents, replace the underlying heading text and update the field rather than relying on the cached entry. The field code itself is never touched, a match that runs across the start or end of a field result is skipped rather than applied, and results inside the older `w:fldSimple` form are not scanned at all
+- **Matches across pictures, marks, symbols and field edges are skipped** — A match whose text runs across a picture, an equation or other embedded object, a footnote, endnote or comment reference mark, an inserted symbol, an optional hyphen, the edge of a field, or a tracked deletion is listed in the preview but skipped when applied. The completion dialog and the change log give the reason. Make that change by hand in Word. The preview does not flag these in advance
+- **Bookmarks and comment ranges are not boundaries** — A match that runs across the start or end of a bookmark, or of the text a comment is anchored to, is applied. That edge then sits at one side of the new text instead of inside it: after the new text when editing in place, before it as a tracked change. A cross-reference to a bookmark whose edge was crossed can show different text the next time Word updates fields
 - **Preview can go stale** — If a document is edited in Word between clicking Preview and clicking Apply, the file is refused outright rather than edited with offsets that no longer describe it. The completion dialog names the file and reports the skipped changes; re-run the preview to pick up the new content. Detection is by file size and modification time, so an edit that changes neither would go unnoticed.
 - **Single-pass matching** — Replacement text is not re-scanned, so replacing "2022" with "2022 and 2025" applies exactly once per original occurrence
 

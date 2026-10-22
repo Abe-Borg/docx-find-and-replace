@@ -7,7 +7,7 @@ import pytest
 from docx import Document
 
 import document_processor as dp
-from conftest import all_text, count_drawings
+from conftest import all_text, body_layouts, count_drawings
 
 
 def _scan(path, find, case=True):
@@ -38,11 +38,14 @@ def test_merged_cell_and_linked_header_replaced_exactly_once(merged_and_linked_d
     assert header == "HEADER 2022 and 2025 CBC"
 
 
-def test_inline_image_survives_apply(image_in_run_doc):
-    matches = _scan(image_in_run_doc, "2022 CBC")
-    dp.apply_changes(matches, "2025 CBC", create_backups=False)
-    assert count_drawings(image_in_run_doc) == 1
-    assert all_text(image_in_run_doc)[0] == "See Figure 2025 CBC ref"
+def test_inline_image_survives_apply(image_beside_match_doc):
+    """The match edits the run that carries the picture; the picture stays put.
+    A picture *inside* a match is skipped instead (test_crossing.py)."""
+    matches = _scan(image_beside_match_doc, "2022 CBC")
+    result = dp.apply_changes(matches, "2025 CBC", create_backups=False)
+    assert result['total_replaced'] == 1
+    assert count_drawings(image_beside_match_doc) == 1
+    assert body_layouts(image_beside_match_doc)[0] == "See Figure [drawing]2025 CBC ref"
 
 
 def test_nested_table_is_replaced(nested_table_doc):

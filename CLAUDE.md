@@ -116,7 +116,8 @@ that way, because tests and the selftest unpack it as a 4-tuple.
 14. **Tracked mode wraps only isolated runs, and skips rather than nests.**
     `_isolate_run_slice` moves everything else the run carried (drawing,
     footnote reference, field character, other text) into sibling runs before
-    `_wrap_in_del` touches it, so an image is never marked deleted. A match with
+    `_wrap_in_del` touches it, so an image is never marked deleted. Such an
+    element can only be beside the match, never inside it (rule 17). A match with
     a `w:ins`/`w:moveTo` ancestor is skipped with `_REASON_NESTED_INS` (Word
     cannot represent an insertion inside an insertion) and a match in the
     comments part with `_REASON_COMMENT_TRACKED` (Word does not track revisions
@@ -132,6 +133,20 @@ that way, because tests and the selftest unpack it as a 4-tuple.
     main thread; the worker gets the dict.
 16. **GUI tests must never touch the real settings file.** `FindReplaceApp`
     takes `settings_path`; the `app` fixture points it under `tmp_path`.
+17. **A match never crosses an element that is not text.** A picture, a note
+    or comment reference mark, a `w:sym`, a field's `w:fldChar` and the like
+    add no characters, so a find can match straight across one. In place, the
+    replacement then goes into the first covered `w:t`, ahead of the element,
+    so the picture ends up after the new text. Across a field's edge, part of
+    the new text lands in the field result and Word discards it on the next
+    field update. Both used to come back `applied`. The traversal records each
+    such element as an opaque zero-length `_TextNode`, and `_apply_edits`
+    skips an edit with one strictly inside its range, with the
+    `_REASON_CROSSES_*` reason `_crossing_reason` picks, before either mode
+    touches anything. One at an edge of the range is not covered and stays
+    beside the new text. Do not "fix" this by giving the element a character
+    in the text: a sentinel would leak into the context, the heading labels
+    and every offset.
 
 ## Traversal specifics
 
@@ -142,13 +157,37 @@ content into the anchoring paragraph's text, corrupting every offset in it.
 Add to the allowlist only after confirming the element cannot contain a nested
 `w:txbxContent`.
 
+An element the walk does not enter still has a position in the text, and
+`_paragraph_text_and_nodes` records it there as an **opaque** `_TextNode`:
+length 0, not editable, `opaque=True`, with nothing added to the text. That
+covers pictures (`w:drawing`, `w:pict`, `w:object`, `mc:AlternateContent` in a
+run), equations, note and comment reference marks, `w:sym`, `w:fldChar`,
+`w:instrText`, `w:fldSimple` and `w:del`/`w:moveFrom`. The text, offsets,
+context and heading labels are exactly what they were before opaque nodes
+existed. An opaque node is "covered" by
+`n.start < end and n.start + n.length > offset` only when it sits strictly
+inside the range, which is the case `_apply_edits` refuses (rule 17).
+
+`_NEUTRAL_MARKERS` is the second allowlist: elements that show nothing and hold
+nothing (`w:pPr`/`w:rPr`/`w:sdtPr`-style properties, bookmarks, comment-range
+ends, proofing marks, permission and custom-XML range markers,
+`w:lastRenderedPageBreak`). They get no node at all, so an edit may cross them.
+Everything that is not text, an atomic leaf, an inline container or a neutral
+marker becomes opaque, so an element nobody anticipated is refused rather than
+moved. Add to `_NEUTRAL_MARKERS` only an element that renders nothing and whose
+move cannot lose or relocate content. `w:lastRenderedPageBreak` must stay
+there: Word writes it through ordinary text, and treating it as opaque would
+refuse legitimate matches in nearly every real document. Bookmarks are neutral
+by decision: crossing one moves its edge to one side of the new text, and
+README says so.
+
 Text boxes are collected as their own paragraphs by `_walk_textboxes`, which
 skips `mc:Fallback` copies (Word writes each text box twice) and skips nested
 text boxes that the inner walk will reach on its own.
 
 `w:del` and `w:moveFrom` are excluded: that text is already marked deleted and
 must not be edited. `w:fldSimple` is excluded, so its cached result is not
-scanned.
+scanned. All three are opaque nodes as well, so a match cannot cross them.
 
 Footnotes, endnotes and comments live in their own parts, reached by
 relationship from the document part (`_NOTE_PARTS`). Any part that is not
@@ -178,8 +217,12 @@ Note the asymmetry: a **complex** field (`w:fldChar` begin / `w:instrText` /
 separate / result / end) keeps its cached result in ordinary `w:r`/`w:t` runs,
 so the walk does scan and replace it. Word regenerates that text on field
 update, which reverts the replacement — README documents this under "Field
-results can revert". Only `w:instrText` (the field code) is never read. If you
-change either behaviour, change the README bullet in the same commit.
+results can revert". Only `w:instrText` (the field code) is never read. The
+`w:fldChar`s and the `w:instrText` are opaque nodes, so a match wholly inside
+one result is replaced, while one that runs across begin, separate or end is
+skipped with `_REASON_CROSSES_FIELD`. The insertion of a tracked edit inside a
+result lands inside it, between separate and end. If you change any of this,
+change the README bullet in the same commit.
 
 ## Testing
 
@@ -193,10 +236,19 @@ exercising the structure and asserts the **resulting document is correct** —
 not merely that the call returned without raising. All four Tier 1 bugs returned
 `replaced=1, errors=[]` while destroying content, so a green return value proves
 nothing. `tests/conftest.py` has builders for hyperlinks, merged cells, linked
-headers, images inside a spanned run, nested tables, text boxes (VML and
-`mc:AlternateContent`), footnotes/endnotes/comments, complex fields, tracked
-changes, formatted runs, `w:rPrChange`, heading styles and outline levels;
-extend it rather than hand-rolling XML in a test.
+headers, images inside a spanned run (inside the match and beside it), nested
+tables, text boxes (VML and `mc:AlternateContent`), footnotes/endnotes/comments
+and their reference marks, complex and simple fields, symbols and other
+single elements in a run, bookmarks, tracked changes, formatted runs,
+`w:rPrChange`, heading styles and outline levels; extend it rather than
+hand-rolling XML in a test.
+
+Where a picture or a field character ends up is asserted through `layout` /
+`body_layouts`, which draw a paragraph with every non-text element in place
+(`"Refer to Article {begin}{separate}2.3{end} above."`) using a walk of their
+own. A test about rule 17 must not trust the processor's traversal to say
+where the element is. `accept_all(path, render=layout)` gives the same view
+after a simulated Accept All.
 
 Tracked-changes tests assert through `revisions()`, `all_revision_ids()`,
 `accept_all()` and `reject_all()` in conftest: the last two simulate Word's

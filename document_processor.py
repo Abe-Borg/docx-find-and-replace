@@ -25,6 +25,12 @@ call ``clear_content()``, which strips every child of the run — destroying
 inline images, footnote references, comment anchors and field characters that
 happen to share a run with matched text.
 
+Those elements add no characters to the paragraph text, so a search can match
+straight across one. The traversal therefore records each of them as an opaque,
+zero-length position, and an edit with one strictly inside its range is skipped
+with a reason: writing the replacement would move the picture, or put the new
+text half inside a field result.
+
 Covered content: body paragraphs, tables (including nested tables), text boxes,
 headers and footers, footnotes, endnotes and comments. Text inside hyperlinks,
 tracked insertions (``w:ins``), smart tags and content controls is included. See
@@ -79,6 +85,7 @@ PartFactory.part_type_for.setdefault(_CT.WML_COMMENTS, XmlPart)
 
 NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 NS_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+NS_M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 NS_XML = "http://www.w3.org/XML/1998/namespace"
 
 
@@ -137,6 +144,29 @@ _INLINE_CONTAINERS = frozenset({
     _w('r'), _w('hyperlink'), _w('ins'), _w('moveTo'),
     _w('smartTag'), _w('sdt'), _w('sdtContent'),
     _w('bdo'), _w('dir'), _w('customXml'),
+})
+
+# Elements among a paragraph's runs, or inside a run, that show nothing and
+# hold no content: properties, range markers, proofing marks and Word's cached
+# page-break position. An edit may cross one; at worst a range marker ends up
+# at the edge of the new text instead of inside it (README "Known
+# Limitations"). This is an allowlist too: any other element that is not text,
+# an atomic leaf or an inline container becomes an opaque position (see
+# `_paragraph_text_and_nodes`), so an element nobody anticipated is refused
+# rather than moved.
+_NEUTRAL_MARKERS = frozenset({
+    _w('pPr'), _w('rPr'), _w('sdtPr'), _w('sdtEndPr'),
+    _w('smartTagPr'), _w('customXmlPr'),
+    _w('bookmarkStart'), _w('bookmarkEnd'),
+    _w('commentRangeStart'), _w('commentRangeEnd'),
+    _w('moveFromRangeStart'), _w('moveFromRangeEnd'),
+    _w('moveToRangeStart'), _w('moveToRangeEnd'),
+    _w('customXmlInsRangeStart'), _w('customXmlInsRangeEnd'),
+    _w('customXmlDelRangeStart'), _w('customXmlDelRangeEnd'),
+    _w('customXmlMoveFromRangeStart'), _w('customXmlMoveFromRangeEnd'),
+    _w('customXmlMoveToRangeStart'), _w('customXmlMoveToRangeEnd'),
+    _w('permStart'), _w('permEnd'), _w('proofErr'),
+    _w('lastRenderedPageBreak'),
 })
 
 
@@ -211,11 +241,18 @@ class FileResult:
 
 @dataclass
 class _TextNode:
-    """One text-bearing leaf element and the slice of paragraph text it owns."""
+    """
+    One leaf of a paragraph's walk and the slice of paragraph text it owns.
+
+    An opaque node owns no characters. It marks where an element that is not
+    text sits (a picture, a note reference mark, a field character), so that
+    an edit can tell it would cross one.
+    """
     element: object
     start: int
     length: int
     editable: bool      # True for w:t; False for atomic leaves (w:tab, w:br, ...)
+    opaque: bool = False  # True for a zero-length position of a non-text element
 
 
 # --------------------------------------------------------------------------
@@ -227,7 +264,12 @@ def _paragraph_text_and_nodes(p_el) -> Tuple[str, List[_TextNode]]:
     Walk a ``w:p`` element and return (full_text, nodes).
 
     ``nodes`` maps character ranges of ``full_text`` onto the XML elements that
-    produced them, built in the same pass as the text itself.
+    produced them, built in the same pass as the text itself. Every element
+    that is neither text, an atomic leaf, an inline container nor a neutral
+    marker is recorded as an opaque node of length zero at the offset where it
+    sits. It adds nothing to the text, so offsets and context are what the
+    reader sees, but an edit whose range has one strictly inside it is refused
+    (`_apply_edits`).
     """
     parts: List[str] = []
     nodes: List[_TextNode] = []
@@ -237,6 +279,8 @@ def _paragraph_text_and_nodes(p_el) -> Tuple[str, List[_TextNode]]:
         nonlocal pos
         for child in el:
             tag = child.tag
+            if not isinstance(tag, str):
+                continue        # an XML comment or processing instruction
             if tag == _T:
                 text = child.text or ""
                 if text:
@@ -250,6 +294,8 @@ def _paragraph_text_and_nodes(p_el) -> Tuple[str, List[_TextNode]]:
                 pos += len(ch)
             elif tag in _INLINE_CONTAINERS:
                 visit(child)
+            elif tag not in _NEUTRAL_MARKERS:
+                nodes.append(_TextNode(child, pos, 0, False, True))
 
     visit(p_el)
     return "".join(parts), nodes
@@ -945,6 +991,44 @@ _REASON_OVERLAP = "overlaps another selected change"
 _REASON_MOVED = "text no longer at the recorded position"
 _REASON_NO_RUN = "match consists only of tabs or breaks"
 
+# A match that crosses an opaque position (see `_paragraph_text_and_nodes`)
+# is skipped with the reason for what it crosses.
+_REASON_CROSSES_OBJECT = "crosses a picture, equation or embedded object"
+_REASON_CROSSES_MARK = "crosses a footnote, endnote or comment reference mark"
+_REASON_CROSSES_FIELD = "crosses a field boundary"
+_REASON_CROSSES_SYMBOL = "crosses an inserted symbol"
+_REASON_CROSSES_DELETION = "crosses tracked deleted text"
+_REASON_CROSSES_OTHER = "crosses an element that is not text"
+
+_CROSSING_REASONS = {
+    _w('drawing'): _REASON_CROSSES_OBJECT,
+    _w('pict'): _REASON_CROSSES_OBJECT,
+    _w('object'): _REASON_CROSSES_OBJECT,
+    _w('contentPart'): _REASON_CROSSES_OBJECT,
+    _w('subDoc'): _REASON_CROSSES_OBJECT,
+    _ALT_CONTENT: _REASON_CROSSES_OBJECT,
+    "{%s}oMath" % NS_M: _REASON_CROSSES_OBJECT,
+    "{%s}oMathPara" % NS_M: _REASON_CROSSES_OBJECT,
+    _w('footnoteReference'): _REASON_CROSSES_MARK,
+    _w('endnoteReference'): _REASON_CROSSES_MARK,
+    _w('commentReference'): _REASON_CROSSES_MARK,
+    _w('footnoteRef'): _REASON_CROSSES_MARK,
+    _w('endnoteRef'): _REASON_CROSSES_MARK,
+    _w('annotationRef'): _REASON_CROSSES_MARK,
+    _w('fldChar'): _REASON_CROSSES_FIELD,
+    _w('instrText'): _REASON_CROSSES_FIELD,
+    _w('delInstrText'): _REASON_CROSSES_FIELD,
+    _w('fldSimple'): _REASON_CROSSES_FIELD,
+    _w('sym'): _REASON_CROSSES_SYMBOL,
+    _w('del'): _REASON_CROSSES_DELETION,
+    _w('moveFrom'): _REASON_CROSSES_DELETION,
+}
+
+
+def _crossing_reason(el) -> str:
+    """The skip reason for a match that crosses the opaque element `el`."""
+    return _CROSSING_REASONS.get(el.tag, _REASON_CROSSES_OTHER)
+
 
 def _edit_in_place(covered: List[_TextNode], offset: int, end: int,
                    replace_text: str) -> None:
@@ -954,7 +1038,9 @@ def _edit_in_place(covered: List[_TextNode], offset: int, end: int,
     The replacement goes into the first covered ``w:t``; later covered ``w:t``
     elements keep only their uncovered text. Runs are never reassigned, so
     anything else a run carries (inline images, footnote and comment
-    references, field characters) survives untouched. Atomic leaves (tabs,
+    references, field characters) survives untouched, and it stays where it
+    was because `_apply_edits` never hands this an opaque node: such an element
+    can only sit at an edge of the range, never inside it. Atomic leaves (tabs,
     breaks) inside the range are single characters, so any overlap covers the
     whole element and it is dropped - the replacement supersedes it.
     """
@@ -1199,6 +1285,11 @@ def _apply_edits(p_el, edits: Sequence[_Edit], case_sensitive: bool = True,
     re-checked, because an adjacent edit applied a moment earlier in this same
     paragraph can legitimately have changed the neighbouring character.
 
+    An edit whose range has an opaque node strictly inside it - a picture, a
+    note reference mark, a symbol, a field's begin/separate/end - is skipped
+    with the reason for what it crosses, before anything is touched. One at
+    either edge of the range is fine: it stays beside the new text.
+
     `tracked`, when given, is a `_TrackedContext`; the edit is then written as
     a Word revision instead of in place (see `_edit_tracked`).
 
@@ -1237,6 +1328,16 @@ def _apply_edits(p_el, edits: Sequence[_Edit], case_sensitive: bool = True,
             continue
 
         covered = [n for n in nodes if n.start < end and n.start + n.length > offset]
+
+        # An opaque node has no length, so it is covered only when it sits
+        # strictly inside the range. Editing across it would move it: in
+        # place the new text goes into the first w:t, ahead of the element;
+        # tracked, the insertion follows the last deletion, after it.
+        crossed = next((n for n in covered if n.opaque), None)
+        if crossed is not None:
+            outcomes.append(_EditOutcome(offset, False, _crossing_reason(crossed.element)))
+            continue
+
         if not any(n.editable for n in covered):
             # Nowhere to put the replacement without inventing a run.
             outcomes.append(_EditOutcome(offset, False, _REASON_NO_RUN))
