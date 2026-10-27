@@ -2,6 +2,19 @@
 
 A Python GUI application for performing batch find-and-replace operations across multiple Word documents (.docx) with a preview-before-commit workflow.
 
+## Status
+
+This tool is feature-complete and in maintenance: it keeps working as described below, and bugs that corrupt a
+document are still fixed, but new features go to [Spec Surgeon](https://github.com/Abe-Borg/spec-surgeon), the
+same author's Word-specification editor, whose Safe-mode **Find and replace** button covers this tool's job without
+an AI call: typed pairs or an attached table (the `find,replace` rule-set CSV this tool saves loads there as the
+table), whole-word and case options, tracked changes or clean copies, the body, headers and footers (footnotes,
+endnotes, comments, regular expressions and paragraph selectors in its Default mode), every occurrence listed under
+the previews with a checkbox to leave a historical reference as it is, a folder of documents attached at once, an
+independent check of every copy, and a record per copy listing each occurrence as replaced or left at your word.
+What Spec Surgeon does differently by design: it writes edited copies and never edits your originals in place (so
+there are no backups to restore), and it does not reach text boxes.
+
 ## Use Case
 
 Updating technical specifications and building code references across multiple Word documents — for example, replacing "2022 CBC" with "2025 CBC" while being able to skip historical references like "designed in 2022."
